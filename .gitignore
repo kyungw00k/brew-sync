@@ -1,0 +1,30 @@
+# Backup files
+Brewfile
+Brewfile.*
+*.backup
+*.bak
+
+# Temporary files
+.DS_Store
+*.tmp
+*.swp
+*.swo
+*~
+
+# Local backup directories
+.brew-backup/
+
+# IDE files
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+.claude/
+
+# Claude
+.claude/
+CLAUDE.md
+
+# System files
+Thumbs.db
+ehthumbs.db

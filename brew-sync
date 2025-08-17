@@ -1,0 +1,1080 @@
+#!/bin/bash
+
+# brew-sync: Homebrew package synchronization tool
+# Usage: brew-sync [backup|restore|list|help] [options]
+
+set -e
+
+# Configuration
+ICLOUD_PATH="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
+# Set default backup directory based on platform
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    # macOS - use iCloud as default
+    DEFAULT_BACKUP_DIR="$ICLOUD_PATH/brew-backup"
+else
+    # Other platforms - use ~/.config/brew-sync
+    DEFAULT_BACKUP_DIR="$HOME/.config/brew-sync"
+fi
+BREWFILE_NAME="Brewfile"
+HOSTNAME=$(hostname -s)
+TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+CURRENT_HOSTNAME=$(hostname -s)
+
+# Color settings
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+NC='\033[0m' # No Color
+
+# Common logging functions
+log_info() {
+    echo -e "${BLUE}•${NC} $1"
+}
+
+log_success() {
+    echo -e "${GREEN}✓${NC} $1"
+}
+
+log_warning() {
+    echo -e "${YELLOW}!${NC} $1"
+}
+
+log_error() {
+    echo -e "${RED}✗${NC} $1"
+}
+
+log_merge() {
+    echo -e "${CYAN}+${NC} $1"
+}
+
+log_restore() {
+    echo -e "${CYAN}→${NC} $1"
+}
+
+# Function: Print main usage
+usage() {
+    echo "brew-sync: Homebrew package synchronization tool"
+    echo ""
+    echo "Usage:"
+    echo "  brew-sync backup [options]    # Backup current packages"
+    echo "  brew-sync restore [options]   # Restore packages from backup"
+    echo "  brew-sync list                # List available backups"
+    echo "  brew-sync help                # Show this help"
+    echo ""
+    echo "Backup examples:"
+    echo "  brew-sync backup                           # Auto-detect backup location"
+    echo "  brew-sync backup --git                     # Backup to Git repository"
+    echo "  brew-sync backup --dropbox -p dev          # Backup to Dropbox with dev profile"
+    echo ""
+    echo "Restore examples:"
+    echo "  brew-sync restore                          # Restore from current Mac backup"
+    echo "  brew-sync restore --merged                 # Restore from merged backup of all Macs"
+    echo "  brew-sync restore --host MacBook-Pro       # Restore from specific Mac backup"
+    echo "  brew-sync restore --dry-run                # Preview only"
+    echo ""
+    echo "For detailed options, add --help to each command:"
+    echo "  brew-sync backup --help"
+    echo "  brew-sync restore --help"
+}
+
+# Function: Print backup usage
+backup_usage() {
+    echo "Usage: brew-sync backup [options]"
+    echo ""
+    echo "Backup location options:"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        echo "  --icloud             Use iCloud Drive (default on macOS)"
+    else
+        echo "  --icloud             Use iCloud Drive"
+    fi
+    echo "  --git                Backup to Git repository"
+    echo "  --dropbox            Backup to Dropbox folder"
+    echo "  --google-drive       Backup to Google Drive folder"
+    echo "  --path PATH          Custom path"
+    echo "  --usb VOLUME         Backup to USB drive (e.g., MyUSB)"
+    echo ""
+    echo "Backup options:"
+    echo "  -p, --profile NAME   Specify profile name (e.g., dev, design)"
+    echo "  --no-merge          Disable merge functionality"
+    echo "  --auto-detect       Auto-detect optimal backup location (default)"
+    echo "  -h, --help          Show this help"
+    echo ""
+    echo "Examples:"
+    echo "  brew-sync backup                           # Auto-detect optimal location"
+    echo "  brew-sync backup --git                     # Backup to Git repository"
+    echo "  brew-sync backup --dropbox -p dev          # Backup to Dropbox with dev profile"
+    echo "  brew-sync backup --path ~/my-backup        # Custom path"
+    echo "  brew-sync backup --usb MyUSB               # Backup to USB drive"
+}
+
+# Function: Print restore usage
+restore_usage() {
+    echo "Usage: brew-sync restore [options]"
+    echo ""
+    echo "Backup source options:"
+    echo "  --icloud               Restore from iCloud Drive"
+    echo "  --git                  Restore from Git repository"
+    echo "  --dropbox              Restore from Dropbox"
+    echo "  --google-drive         Restore from Google Drive"
+    echo "  --path PATH            Restore from custom path"
+    echo "  --usb VOLUME           Restore from USB drive"
+    echo "  --auto-detect          Auto-detect optimal backup location (default)"
+    echo ""
+    echo "Restore type options (select one):"
+    echo "  --merged               Use merged Brewfile (packages from all Macs)"
+    echo "  --host HOSTNAME        Use specific Mac's Brewfile"
+    echo "  -p, --profile NAME     Use specific profile"
+    echo "  (default: current Mac's Brewfile)"
+    echo ""
+    echo "Installation options:"
+    echo "  -d, --dry-run          Preview only without actual installation"
+    echo "  -f, --force            Overwrite existing Brewfile and proceed"
+    echo "  --skip-mas             Skip Mac App Store app installation"
+    echo "  -v, --verbose          Verbose output"
+    echo "  -l, --list             List available backups"
+    echo "  -h, --help             Show this help"
+    echo ""
+    echo "Examples:"
+    echo "  brew-sync restore                     # Auto-detect and restore current Mac backup"
+    echo "  brew-sync restore --git --merged      # Restore from Git repository merged packages"
+    echo "  brew-sync restore --dropbox --host MacBook-Pro  # Restore from specific Mac backup in Dropbox"
+    echo "  brew-sync restore --path ~/backup -p dev --merged  # Restore from custom path dev profile merged"
+}
+
+# Function: Auto-detect optimal backup location
+detect_backup_location() {
+    local detected_path=""
+    local method=""
+    
+    # 1. Check Git repository (highest priority)
+    if git rev-parse --git-dir &>/dev/null; then
+        detected_path="$(git rev-parse --show-toplevel)"
+        method="git"
+        log_info "Git repository detected: $detected_path"
+        BACKUP_DIR="$detected_path"
+        BACKUP_METHOD="$method"
+        return 0
+    fi
+    
+    # 2. Check iCloud Drive (macOS only)
+    if [[ "$OSTYPE" == "darwin"* ]] && [ -d "$ICLOUD_PATH" ]; then
+        detected_path="$DEFAULT_BACKUP_DIR"
+        method="icloud"
+        log_info "iCloud Drive detected: $detected_path"
+        BACKUP_DIR="$detected_path"
+        BACKUP_METHOD="$method"
+        return 0
+    fi
+    
+    # 3. Check Dropbox
+    for dropbox_path in "$HOME/Dropbox" "$HOME/Library/CloudStorage/Dropbox-*"; do
+        if [ -d "$dropbox_path" ]; then
+            detected_path="$dropbox_path/brew-backup"
+            method="dropbox"
+            log_info "Dropbox detected: $detected_path"
+            BACKUP_DIR="$detected_path"
+            BACKUP_METHOD="$method"
+            return 0
+        fi
+    done
+    
+    # 4. Check Google Drive
+    for gdrive_path in "$HOME/Google Drive" "$HOME/Library/CloudStorage/GoogleDrive-*"; do
+        if [ -d "$gdrive_path" ]; then
+            detected_path="$gdrive_path/brew-backup"
+            method="google-drive"
+            log_info "Google Drive detected: $detected_path"
+            BACKUP_DIR="$detected_path"
+            BACKUP_METHOD="$method"
+            return 0
+        fi
+    done
+    
+    # 5. Use platform-specific default directory
+    detected_path="$DEFAULT_BACKUP_DIR"
+    method="local"
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        log_warning "No cloud service found, using local backup: $detected_path"
+    else
+        log_info "Using default backup location: $detected_path"
+    fi
+    
+    # Set global variables
+    BACKUP_DIR="$detected_path"
+    BACKUP_METHOD="$method"
+}
+
+# Function: Handle Git backup
+handle_git_backup() {
+    if ! git rev-parse --git-dir &>/dev/null; then
+        log_error "Current directory is not a Git repository."
+        log_info "To initialize Git repository:"
+        log_info "  git init"
+        log_info "  git remote add origin <repository-url>"
+        exit 1
+    fi
+    
+    local git_root=$(git rev-parse --show-toplevel)
+    BACKUP_DIR="$git_root"
+    BACKUP_METHOD="git"
+    
+    log_info "Backing up to Git repository: $git_root"
+}
+
+# Function: List available backups
+list_backups() {
+    log_info "Available backups:"
+    echo ""
+    
+    # Default profile hosts
+    if [ -d "$BACKUP_DIR/hosts" ]; then
+        echo "📱 Individual Mac backups:"
+        for host_dir in "$BACKUP_DIR/hosts"/*; do
+            if [ -d "$host_dir" ] && [ -f "$host_dir/Brewfile" ]; then
+                hostname=$(basename "$host_dir")
+                if [ -f "$host_dir/backup_info.txt" ]; then
+                    last_backup=$(grep "Last backup:" "$host_dir/backup_info.txt" | cut -d: -f2- | xargs)
+                    package_count=$(grep "Total packages:" "$host_dir/backup_info.txt" | cut -d: -f2 | xargs)
+                    echo "  • $hostname (packages: $package_count, $last_backup)"
+                else
+                    echo "  • $hostname"
+                fi
+            fi
+        done
+        echo ""
+    fi
+    
+    # Merged backup
+    if [ -d "$BACKUP_DIR/merged" ]; then
+        echo "🔄 Merged backups:"
+        if [ -f "$BACKUP_DIR/merged/Brewfile" ]; then
+            if [ -f "$BACKUP_DIR/merged/merge_info.txt" ]; then
+                last_merge=$(grep "Last merge:" "$BACKUP_DIR/merged/merge_info.txt" | cut -d: -f2- | xargs)
+                mac_count=$(grep "Included Mac count:" "$BACKUP_DIR/merged/merge_info.txt" | cut -d: -f2 | xargs)
+                package_count=$(grep "Total packages:" "$BACKUP_DIR/merged/merge_info.txt" | cut -d: -f2 | xargs)
+                echo "  • Default merged (Macs: ${mac_count}, packages: $package_count, $last_merge)"
+            else
+                echo "  • Default merged"
+            fi
+        fi
+        echo ""
+    fi
+    
+    # Profile-specific backups
+    if [ -d "$BACKUP_DIR/profiles" ]; then
+        echo "📂 Profile backups:"
+        for profile_dir in "$BACKUP_DIR/profiles"/*; do
+            if [ -d "$profile_dir" ]; then
+                profile=$(basename "$profile_dir")
+                echo "  Profile: $profile"
+                
+                # Individual Macs within profile
+                for host_dir in "$profile_dir"/*; do
+                    if [ -d "$host_dir" ] && [ -f "$host_dir/Brewfile" ]; then
+                        hostname=$(basename "$host_dir")
+                        if [ -f "$host_dir/backup_info.txt" ]; then
+                            package_count=$(grep "Total packages:" "$host_dir/backup_info.txt" | cut -d: -f2 | xargs)
+                            echo "    • $hostname (packages: $package_count)"
+                        else
+                            echo "    • $hostname"
+                        fi
+                    fi
+                done
+                
+                # Profile merged backup
+                if [ -f "$BACKUP_DIR/merged/Brewfile_$profile" ]; then
+                    if [ -f "$BACKUP_DIR/merged/merge_info_$profile.txt" ]; then
+                        mac_count=$(grep "Included Mac count:" "$BACKUP_DIR/merged/merge_info_$profile.txt" | cut -d: -f2 | xargs)
+                        package_count=$(grep "Total packages:" "$BACKUP_DIR/merged/merge_info_$profile.txt" | cut -d: -f2 | xargs)
+                        echo "    🔄 Merged version (Macs: ${mac_count}, packages: $package_count)"
+                    else
+                        echo "    🔄 Merged version"
+                    fi
+                fi
+                echo ""
+            fi
+        done
+    fi
+}
+
+# Function: Backup implementation
+do_backup() {
+    # Default options
+    local MERGE_MODE=true
+    local PROFILE=""
+    local CUSTOM_PATH=""
+    local USE_GIT=false
+    local AUTO_DETECT=true
+
+    # Parse backup arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -p|--profile)
+                PROFILE="$2"
+                shift 2
+                ;;
+            --no-merge)
+                MERGE_MODE=false
+                shift
+                ;;
+            --icloud)
+                CUSTOM_PATH="$DEFAULT_BACKUP_DIR"
+                AUTO_DETECT=false
+                shift
+                ;;
+            --git)
+                USE_GIT=true
+                AUTO_DETECT=false
+                shift
+                ;;
+            --dropbox)
+                for dropbox_path in "$HOME/Dropbox" "$HOME/Library/CloudStorage/Dropbox-*"; do
+                    if [ -d "$dropbox_path" ]; then
+                        CUSTOM_PATH="$dropbox_path/brew-backup"
+                        break
+                    fi
+                done
+                if [ -z "$CUSTOM_PATH" ]; then
+                    log_error "Dropbox folder not found."
+                    exit 1
+                fi
+                AUTO_DETECT=false
+                shift
+                ;;
+            --google-drive)
+                for gdrive_path in "$HOME/Google Drive" "$HOME/Library/CloudStorage/GoogleDrive-*"; do
+                    if [ -d "$gdrive_path" ]; then
+                        CUSTOM_PATH="$gdrive_path/brew-backup"
+                        break
+                    fi
+                done
+                if [ -z "$CUSTOM_PATH" ]; then
+                    log_error "Google Drive folder not found."
+                    exit 1
+                fi
+                AUTO_DETECT=false
+                shift
+                ;;
+            --path)
+                CUSTOM_PATH="$2"
+                AUTO_DETECT=false
+                shift 2
+                ;;
+            --usb)
+                USB_VOLUME="$2"
+                if [ -d "/Volumes/$USB_VOLUME" ]; then
+                    CUSTOM_PATH="/Volumes/$USB_VOLUME/brew-backup"
+                else
+                    log_error "USB drive not found: /Volumes/$USB_VOLUME"
+                    exit 1
+                fi
+                AUTO_DETECT=false
+                shift 2
+                ;;
+            -h|--help)
+                backup_usage
+                exit 0
+                ;;
+            *)
+                log_error "Unknown backup option: $1"
+                backup_usage
+                exit 1
+                ;;
+        esac
+    done
+
+    # Determine backup location
+    if [ "$USE_GIT" = true ]; then
+        handle_git_backup
+    elif [ -n "$CUSTOM_PATH" ]; then
+        BACKUP_DIR="$CUSTOM_PATH"
+        BACKUP_METHOD="custom"
+    elif [ "$AUTO_DETECT" = true ]; then
+        detect_backup_location
+    else
+        BACKUP_DIR="$DEFAULT_BACKUP_DIR"
+        BACKUP_METHOD="icloud"
+    fi
+
+    # Set directory paths
+    if [ -n "$PROFILE" ]; then
+        HOST_DIR="$BACKUP_DIR/profiles/$PROFILE/$HOSTNAME"
+        PROFILE_SUFFIX="_$PROFILE"
+    else
+        HOST_DIR="$BACKUP_DIR/hosts/$HOSTNAME"
+        PROFILE_SUFFIX=""
+    fi
+
+    MERGED_DIR="$BACKUP_DIR/merged"
+
+    # Check Homebrew installation
+    if ! command -v brew &> /dev/null; then
+        log_error "Homebrew is not installed."
+        exit 1
+    fi
+
+    # Check and create backup directory
+    if [ "$BACKUP_METHOD" = "icloud" ] && [ ! -d "$ICLOUD_PATH" ]; then
+        log_error "iCloud Drive is not enabled or path not found."
+        log_info "iCloud Drive path: $ICLOUD_PATH"
+        log_info "Please use alternative backup methods:"
+        log_info "  --git                Use Git repository"
+        log_info "  --dropbox            Use Dropbox" 
+        log_info "  --google-drive       Use Google Drive"
+        log_info "  --path ~/backup      Custom path"
+        exit 1
+    fi
+
+    # Create backup directories
+    mkdir -p "$HOST_DIR"
+    if [ "$MERGE_MODE" = true ]; then
+        mkdir -p "$MERGED_DIR"
+    fi
+
+    log_info "Starting Brewfile backup..."
+    if [ -n "$PROFILE" ]; then
+        log_info "Profile: $PROFILE"
+    fi
+    log_info "Host: $HOSTNAME"
+
+    # Generate Brewfile in temporary directory
+    TEMP_DIR=$(mktemp -d)
+    cd "$TEMP_DIR"
+
+    # Generate Brewfile
+    log_info "Generating current package list..."
+    if brew bundle dump --force; then
+        log_success "Brewfile generation completed"
+    else
+        log_error "Brewfile generation failed"
+        rm -rf "$TEMP_DIR"
+        exit 1
+    fi
+
+    # Host-specific backup
+    CURRENT_BREWFILE="$TEMP_DIR/$BREWFILE_NAME"
+    HOST_BREWFILE="$HOST_DIR/$BREWFILE_NAME"
+
+    # Compare with existing file
+    local CHANGES_DETECTED=false
+    if [ -f "$HOST_BREWFILE" ]; then
+        if cmp -s "$CURRENT_BREWFILE" "$HOST_BREWFILE"; then
+            log_info "[$HOSTNAME] No changes detected."
+            CHANGES_DETECTED=false
+        else
+            log_info "[$HOSTNAME] Changes detected."
+            # Backup existing file with timestamp
+            BACKUP_FILE="$HOST_DIR/Brewfile_$TIMESTAMP"
+            cp "$HOST_BREWFILE" "$BACKUP_FILE"
+            log_info "[$HOSTNAME] Backed up existing Brewfile: Brewfile_$TIMESTAMP"
+            CHANGES_DETECTED=true
+        fi
+    else
+        log_info "[$HOSTNAME] First backup."
+        CHANGES_DETECTED=true
+    fi
+
+    # Copy new Brewfile to host directory
+    cp "$CURRENT_BREWFILE" "$HOST_BREWFILE"
+
+    # Create host-specific backup info file
+    cat > "$HOST_DIR/backup_info.txt" << EOF
+Hostname: $HOSTNAME
+Last backup: $(date)
+User: $(whoami)
+macOS version: $(sw_vers -productVersion)
+Homebrew version: $(brew --version | head -n1)
+Profile: ${PROFILE:-"default"}
+Total packages: $(grep -E '^(brew|cask|mas)' "$HOST_BREWFILE" | wc -l | tr -d ' ')
+EOF
+
+    # Package statistics
+    BREW_COUNT=$(grep '^brew ' "$HOST_BREWFILE" | wc -l | tr -d ' ')
+    CASK_COUNT=$(grep '^cask ' "$HOST_BREWFILE" | wc -l | tr -d ' ')
+    MAS_COUNT=$(grep '^mas ' "$HOST_BREWFILE" | wc -l | tr -d ' ')
+
+    log_success "[$HOSTNAME] Backup completed!"
+    log_info "Backup location: $HOST_BREWFILE"
+    log_info "Package statistics: Homebrew($BREW_COUNT) Cask($CASK_COUNT) MAS($MAS_COUNT)"
+
+    # Perform merge operation
+    if [ "$MERGE_MODE" = true ] && [ "$CHANGES_DETECTED" = true ]; then
+        log_merge "Starting multi-Mac environment merge..."
+        
+        # Collect Brewfiles from all hosts
+        ALL_BREWFILES=()
+        if [ -n "$PROFILE" ]; then
+            SEARCH_DIR="$BACKUP_DIR/profiles/$PROFILE"
+        else
+            SEARCH_DIR="$BACKUP_DIR/hosts"
+        fi
+        
+        if [ -d "$SEARCH_DIR" ]; then
+            while IFS= read -r -d '' brewfile; do
+                ALL_BREWFILES+=("$brewfile")
+            done < <(find "$SEARCH_DIR" -name "Brewfile" -type f -print0)
+        fi
+        
+        if [ ${#ALL_BREWFILES[@]} -gt 1 ]; then
+            log_merge "Found Macs: ${#ALL_BREWFILES[@]}"
+            
+            # Generate merged Brewfile
+            MERGED_BREWFILE="$MERGED_DIR/Brewfile$PROFILE_SUFFIX"
+            TEMP_MERGED="$TEMP_DIR/merged_brewfile"
+            
+            # Collect and sort tap statements
+            {
+                echo "# Merged Brewfile - $(date)"
+                echo "# Included Macs: $(find "$SEARCH_DIR" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | tr '\n' ' ')"
+                echo ""
+                
+                # Collect taps
+                for brewfile in "${ALL_BREWFILES[@]}"; do
+                    grep '^tap ' "$brewfile" 2>/dev/null || true
+                done | sort -u
+                
+                echo ""
+                
+                # Collect brews
+                for brewfile in "${ALL_BREWFILES[@]}"; do
+                    grep '^brew ' "$brewfile" 2>/dev/null || true
+                done | sort -u
+                
+                echo ""
+                
+                # Collect casks
+                for brewfile in "${ALL_BREWFILES[@]}"; do
+                    grep '^cask ' "$brewfile" 2>/dev/null || true
+                done | sort -u
+                
+                echo ""
+                
+                # Collect mas
+                for brewfile in "${ALL_BREWFILES[@]}"; do
+                    grep '^mas ' "$brewfile" 2>/dev/null || true
+                done | sort -u
+                
+            } > "$TEMP_MERGED"
+            
+            # Compare with existing merge file
+            if [ -f "$MERGED_BREWFILE" ] && cmp -s "$TEMP_MERGED" "$MERGED_BREWFILE"; then
+                log_merge "No changes in merged file."
+            else
+                # Backup existing merge file
+                if [ -f "$MERGED_BREWFILE" ]; then
+                    cp "$MERGED_BREWFILE" "$MERGED_DIR/Brewfile${PROFILE_SUFFIX}_$TIMESTAMP"
+                    log_merge "Backed up existing merge file."
+                fi
+                
+                cp "$TEMP_MERGED" "$MERGED_BREWFILE"
+                
+                # Merge statistics
+                MERGED_BREW=$(grep '^brew ' "$MERGED_BREWFILE" | wc -l | tr -d ' ')
+                MERGED_CASK=$(grep '^cask ' "$MERGED_BREWFILE" | wc -l | tr -d ' ')
+                MERGED_MAS=$(grep '^mas ' "$MERGED_BREWFILE" | wc -l | tr -d ' ')
+                
+                log_success "Merge completed! Total packages: Homebrew($MERGED_BREW) Cask($MERGED_CASK) MAS($MERGED_MAS)"
+                log_info "Merge file location: $MERGED_BREWFILE"
+            fi
+            
+            # Create merge info file
+            cat > "$MERGED_DIR/merge_info$PROFILE_SUFFIX.txt" << EOF
+Last merge: $(date)
+Profile: ${PROFILE:-"default"}
+Included Mac count: ${#ALL_BREWFILES[@]}
+Included Macs: $(find "$SEARCH_DIR" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | tr '\n' ' ')
+Total packages: $(grep -E '^(brew|cask|mas)' "$MERGED_BREWFILE" | wc -l | tr -d ' ')
+EOF
+            
+        else
+            log_merge "Only current Mac found, merge not needed."
+        fi
+    fi
+
+    # Clean up temporary directory
+    rm -rf "$TEMP_DIR"
+
+    # Clean up old backup files (keep 30 per host)
+    OLD_BACKUPS=$(ls -1 "$HOST_DIR"/Brewfile_* 2>/dev/null | wc -l | tr -d ' ')
+    if [ "$OLD_BACKUPS" -gt 30 ]; then
+        log_info "[$HOSTNAME] Cleaning up old backup files..."
+        ls -1t "$HOST_DIR"/Brewfile_* | tail -n +31 | xargs rm -f
+    fi
+
+    # Clean up old merge files
+    if [ "$MERGE_MODE" = true ] && [ -d "$MERGED_DIR" ]; then
+        OLD_MERGED=$(ls -1 "$MERGED_DIR"/Brewfile${PROFILE_SUFFIX}_* 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$OLD_MERGED" -gt 20 ]; then
+            log_merge "Cleaning up old merge backups..."
+            ls -1t "$MERGED_DIR"/Brewfile${PROFILE_SUFFIX}_* | tail -n +21 | xargs rm -f
+        fi
+    fi
+
+    log_success "All operations completed!"
+
+    # Git repository commit and push suggestion
+    if [ "$BACKUP_METHOD" = "git" ] && [ "$CHANGES_DETECTED" = true ]; then
+        echo ""
+        log_info "🔄 Git backup follow-up actions:"
+        log_info "  Commit changes: git add . && git commit -m \"Update Brewfile from $HOSTNAME\""
+        log_info "  Push to remote: git push"
+        echo ""
+        echo -n "Would you like to commit and push to Git now? (y/N): "
+        read -r git_response
+        if [[ "$git_response" =~ ^[Yy]$ ]]; then
+            cd "$BACKUP_DIR"
+            git add .
+            if git commit -m "Update Brewfile from $HOSTNAME - $(date)"; then
+                log_success "Git commit completed"
+                if git push 2>/dev/null; then
+                    log_success "Git push completed"
+                else
+                    log_warning "Git push failed. Please push manually: git push"
+                fi
+            else
+                log_info "No changes to commit."
+            fi
+        fi
+    fi
+
+    # Available restore options guide
+    echo ""
+    log_info "📱 Restore options:"
+    case "$BACKUP_METHOD" in
+        "git")
+            log_info "  On other Mac: git clone <repository-url> && cd <repo> && brew-sync restore"
+            ;;
+        "icloud"|"dropbox"|"google-drive")
+            log_info "  On other Mac with same cloud service synced:"
+            ;;
+        "local")
+            log_info "  Available only on current Mac:"
+            ;;
+        "custom")
+            log_info "  On other Mac with access to same path:"
+            ;;
+    esac
+
+    if [ "$BACKUP_METHOD" != "git" ]; then
+        log_info "  Individual restore: brew-sync restore --host $HOSTNAME"
+        if [ -n "$PROFILE" ]; then
+            log_info "  Profile restore: brew-sync restore --profile $PROFILE"
+            log_info "  Merged restore: brew-sync restore --profile $PROFILE --merged"
+        else
+            log_info "  Merged restore: brew-sync restore --merged"
+        fi
+        
+        # Additional guidance by backup method
+        case "$BACKUP_METHOD" in
+            "local")
+                log_warning "Local backup is only available on current Mac."
+                log_info "For sharing with other Macs, consider using cloud services or Git."
+                ;;
+        esac
+    fi
+}
+
+# Function: Restore implementation
+do_restore() {
+    # Default options
+    local DRY_RUN=false
+    local FORCE=false
+    local SKIP_MAS=false
+    local VERBOSE=false
+    local USE_MERGED=false
+    local TARGET_HOST=""
+    local PROFILE=""
+    local CUSTOM_PATH=""
+    local USE_GIT=false
+    local AUTO_DETECT=true
+
+    # Parse restore arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -d|--dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            -f|--force)
+                FORCE=true
+                shift
+                ;;
+            --skip-mas)
+                SKIP_MAS=true
+                shift
+                ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
+            --merged)
+                USE_MERGED=true
+                shift
+                ;;
+            --host)
+                TARGET_HOST="$2"
+                shift 2
+                ;;
+            -p|--profile)
+                PROFILE="$2"
+                shift 2
+                ;;
+            -l|--list)
+                # Auto-detect backup location for listing
+                detect_backup_location 2>/dev/null || BACKUP_DIR="$DEFAULT_BACKUP_DIR"
+                list_backups
+                exit 0
+                ;;
+            --icloud)
+                CUSTOM_PATH="$DEFAULT_BACKUP_DIR"
+                AUTO_DETECT=false
+                shift
+                ;;
+            --git)
+                USE_GIT=true
+                AUTO_DETECT=false
+                shift
+                ;;
+            --dropbox)
+                for dropbox_path in "$HOME/Dropbox" "$HOME/Library/CloudStorage/Dropbox-*"; do
+                    if [ -d "$dropbox_path" ]; then
+                        CUSTOM_PATH="$dropbox_path/brew-backup"
+                        break
+                    fi
+                done
+                if [ -z "$CUSTOM_PATH" ]; then
+                    log_error "Dropbox folder not found."
+                    exit 1
+                fi
+                AUTO_DETECT=false
+                shift
+                ;;
+            --google-drive)
+                for gdrive_path in "$HOME/Google Drive" "$HOME/Library/CloudStorage/GoogleDrive-*"; do
+                    if [ -d "$gdrive_path" ]; then
+                        CUSTOM_PATH="$gdrive_path/brew-backup"
+                        break
+                    fi
+                done
+                if [ -z "$CUSTOM_PATH" ]; then
+                    log_error "Google Drive folder not found."
+                    exit 1
+                fi
+                AUTO_DETECT=false
+                shift
+                ;;
+            --path)
+                CUSTOM_PATH="$2"
+                AUTO_DETECT=false
+                shift 2
+                ;;
+            --usb)
+                USB_VOLUME="$2"
+                if [ -d "/Volumes/$USB_VOLUME" ]; then
+                    CUSTOM_PATH="/Volumes/$USB_VOLUME/brew-backup"
+                else
+                    log_error "USB drive not found: /Volumes/$USB_VOLUME"
+                    exit 1
+                fi
+                AUTO_DETECT=false
+                shift 2
+                ;;
+            -h|--help)
+                restore_usage
+                exit 0
+                ;;
+            *)
+                log_error "Unknown restore option: $1"
+                restore_usage
+                exit 1
+                ;;
+        esac
+    done
+
+    # Determine backup location
+    if [ "$USE_GIT" = true ]; then
+        handle_git_backup
+    elif [ -n "$CUSTOM_PATH" ]; then
+        BACKUP_DIR="$CUSTOM_PATH"
+        BACKUP_METHOD="custom"
+    elif [ "$AUTO_DETECT" = true ]; then
+        detect_backup_location
+    else
+        BACKUP_DIR="$DEFAULT_BACKUP_DIR"
+        BACKUP_METHOD="icloud"
+    fi
+
+    # Determine Brewfile path
+    local BACKUP_BREWFILE=""
+    local SOURCE_DESC=""
+    
+    if [ "$USE_MERGED" = true ]; then
+        if [ -n "$PROFILE" ]; then
+            BACKUP_BREWFILE="$BACKUP_DIR/merged/Brewfile_$PROFILE"
+            SOURCE_DESC="Profile '$PROFILE' merged backup"
+        else
+            BACKUP_BREWFILE="$BACKUP_DIR/merged/Brewfile"
+            SOURCE_DESC="All Macs merged backup"
+        fi
+    elif [ -n "$TARGET_HOST" ]; then
+        if [ -n "$PROFILE" ]; then
+            BACKUP_BREWFILE="$BACKUP_DIR/profiles/$PROFILE/$TARGET_HOST/Brewfile"
+            SOURCE_DESC="$TARGET_HOST (profile: $PROFILE)"
+        else
+            BACKUP_BREWFILE="$BACKUP_DIR/hosts/$TARGET_HOST/Brewfile"
+            SOURCE_DESC="$TARGET_HOST Mac individual backup"
+        fi
+    elif [ -n "$PROFILE" ]; then
+        BACKUP_BREWFILE="$BACKUP_DIR/profiles/$PROFILE/$CURRENT_HOSTNAME/Brewfile"
+        SOURCE_DESC="Current Mac's '$PROFILE' profile backup"
+    else
+        BACKUP_BREWFILE="$BACKUP_DIR/hosts/$CURRENT_HOSTNAME/Brewfile"
+        SOURCE_DESC="Current Mac individual backup"
+    fi
+
+    # Check Brewfile existence
+    if [ ! -f "$BACKUP_BREWFILE" ]; then
+        log_error "Backup Brewfile not found: $BACKUP_BREWFILE"
+        echo ""
+        log_info "To check available backups: brew-sync list"
+        echo ""
+        log_info "Other options:"
+        if [ "$USE_MERGED" = true ]; then
+            log_info "  Use individual Mac backup: brew-sync restore --host HOSTNAME"
+        else
+            log_info "  Use merged backup: brew-sync restore --merged"
+        fi
+        if [ -z "$PROFILE" ]; then
+            log_info "  Specify profile: brew-sync restore --profile PROFILE_NAME"
+        fi
+        exit 1
+    fi
+
+    # Check Homebrew installation
+    if ! command -v brew &> /dev/null; then
+        log_warning "Homebrew is not installed. Installing..."
+        if [ "$DRY_RUN" = false ]; then
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+            log_success "Homebrew installation completed"
+        else
+            log_info "[DRY-RUN] Installing Homebrew"
+        fi
+    fi
+
+    # Analyze Brewfile contents
+    BREW_COUNT=$(grep '^brew ' "$BACKUP_BREWFILE" | wc -l | tr -d ' ')
+    CASK_COUNT=$(grep '^cask ' "$BACKUP_BREWFILE" | wc -l | tr -d ' ')
+    MAS_COUNT=$(grep '^mas ' "$BACKUP_BREWFILE" | wc -l | tr -d ' ')
+
+    if [ "$DRY_RUN" = true ]; then
+        log_info "=== DRY RUN mode - No actual installation will be performed ==="
+        echo
+        if [ "$USE_MERGED" = true ]; then
+            log_info "  Actual installation: brew-sync restore --merged"
+        elif [ -n "$TARGET_HOST" ]; then
+            log_info "  Actual installation: brew-sync restore --host $TARGET_HOST"
+        elif [ -n "$PROFILE" ]; then
+            log_info "  Actual installation: brew-sync restore --profile $PROFILE"
+        else
+            log_info "  Actual installation: brew-sync restore"
+        fi
+    fi
+
+    log_restore "Restore source: $SOURCE_DESC"
+    log_info "Brewfile path: $BACKUP_BREWFILE"
+
+    # Output backup information
+    BACKUP_INFO_FILE=$(dirname "$BACKUP_BREWFILE")/backup_info.txt
+    MERGE_INFO_FILE=""
+
+    if [ "$USE_MERGED" = true ]; then
+        if [ -n "$PROFILE" ]; then
+            MERGE_INFO_FILE="$BACKUP_DIR/merged/merge_info_$PROFILE.txt"
+        else
+            MERGE_INFO_FILE="$BACKUP_DIR/merged/merge_info.txt"
+        fi
+    fi
+
+    if [ -f "$MERGE_INFO_FILE" ]; then
+        log_info "Merged backup information:"
+        cat "$MERGE_INFO_FILE" | sed 's/^/  /'
+        echo
+    elif [ -f "$BACKUP_INFO_FILE" ]; then
+        log_info "Backup information:"
+        cat "$BACKUP_INFO_FILE" | sed 's/^/  /'
+        echo
+    fi
+
+    log_info "Package information to restore:"
+    log_info "  - Homebrew packages: $BREW_COUNT"
+    log_info "  - Cask apps: $CASK_COUNT"
+    log_info "  - Mac App Store apps: $MAS_COUNT"
+    echo
+
+    # Handle existing Brewfile backup
+    if [ -f "Brewfile" ] && [ "$FORCE" = false ]; then
+        log_warning "Brewfile already exists in current directory."
+        echo -n "Do you want to backup the existing file and continue? (y/N): "
+        read -r response
+        if [[ ! "$response" =~ ^[Yy]$ ]]; then
+            log_info "Operation cancelled."
+            exit 0
+        fi
+        
+        local TIMESTAMP_LOCAL=$(date +"%Y%m%d_%H%M%S")
+        if [ "$DRY_RUN" = false ]; then
+            mv Brewfile "Brewfile.backup_$TIMESTAMP_LOCAL"
+            log_info "Backed up existing Brewfile: Brewfile.backup_$TIMESTAMP_LOCAL"
+        else
+            log_info "[DRY-RUN] Backing up existing Brewfile: Brewfile.backup_$TIMESTAMP_LOCAL"
+        fi
+    fi
+
+    # Copy Brewfile
+    if [ "$DRY_RUN" = false ]; then
+        cp "$BACKUP_BREWFILE" "./Brewfile"
+        log_success "Copied Brewfile to current directory"
+    else
+        log_info "[DRY-RUN] Copying Brewfile to current directory"
+    fi
+
+    # Check Mac App Store CLI tool (mas if needed)
+    if [ "$MAS_COUNT" -gt 0 ] && [ "$SKIP_MAS" = false ]; then
+        if ! command -v mas &> /dev/null; then
+            log_info "Mac App Store CLI tool (mas) is required. Installing..."
+            if [ "$DRY_RUN" = false ]; then
+                brew install mas
+            else
+                log_info "[DRY-RUN] Installing mas"
+            fi
+        fi
+    fi
+
+    # Configure bundle command
+    BUNDLE_ARGS=""
+    if [ "$VERBOSE" = true ]; then
+        BUNDLE_ARGS="$BUNDLE_ARGS --verbose"
+    fi
+
+    if [ "$SKIP_MAS" = true ]; then
+        BUNDLE_ARGS="$BUNDLE_ARGS --no-mas"
+        log_info "Skipping Mac App Store app installation"
+    fi
+
+    # Start package installation
+    log_restore "Starting package installation..."
+
+    if [ "$DRY_RUN" = true ]; then
+        log_info "[DRY-RUN] Running brew bundle check"
+        if brew bundle check --no-upgrade 2>/dev/null; then
+            log_info "[DRY-RUN] All packages are already installed"
+        else
+            log_info "[DRY-RUN] Packages that need installation:"
+            brew bundle check --no-upgrade 2>&1 | grep -E "^(brew|cask|mas)" | head -10
+            TOTAL_MISSING=$(brew bundle check --no-upgrade 2>&1 | grep -E "^(brew|cask|mas)" | wc -l | tr -d ' ')
+            if [ "$TOTAL_MISSING" -gt 10 ]; then
+                log_info "[DRY-RUN] ... and $((TOTAL_MISSING - 10)) more"
+            fi
+            log_info "[DRY-RUN] Following command will be executed:"
+            log_info "[DRY-RUN] brew bundle $BUNDLE_ARGS"
+        fi
+    else
+        # Perform actual installation
+        log_info "Running brew bundle..."
+        
+        if brew bundle $BUNDLE_ARGS; then
+            log_success "All packages installed successfully!"
+        else
+            log_warning "Some package installations may have failed."
+            log_info "Check the output above for details."
+            log_info "Retry failed packages: brew bundle --verbose"
+        fi
+    fi
+
+    # Post-installation cleanup
+    if [ "$DRY_RUN" = false ]; then
+        log_info "Performing post-installation cleanup..."
+        
+        # Homebrew cleanup
+        if [ "$VERBOSE" = true ]; then
+            brew cleanup --prune=all
+        else
+            brew cleanup --prune=all &>/dev/null || true
+        fi
+        
+        # Dependency check
+        if ! brew doctor &>/dev/null; then
+            log_warning "brew doctor warnings detected."
+            log_info "To check: brew doctor"
+        fi
+        
+        # Final statistics
+        INSTALLED_BREW=$(brew list --formula | wc -l | tr -d ' ')
+        INSTALLED_CASK=$(brew list --cask | wc -l | tr -d ' ')
+        
+        log_success "All operations completed!"
+        log_info "Installed environment:"
+        log_info "  - Brewfile created in current directory"
+        log_info "  - Installed packages: Homebrew($INSTALLED_BREW) Cask($INSTALLED_CASK)"
+        log_info "  - Check sync: brew bundle check"
+        log_info "  - Full list: brew list"
+        
+        # Additional restore options guidance
+        if [ "$USE_MERGED" = false ]; then
+            echo ""
+            log_info "💡 Other restore options:"
+            log_info "  All Mac packages: brew-sync restore --merged"
+            if [ -n "$PROFILE" ]; then
+                log_info "  Profile merged: brew-sync restore --profile $PROFILE --merged"
+            fi
+        fi
+    else
+        log_info "[DRY-RUN] For actual installation, run again without -d option"
+        echo ""
+        log_info "💡 Recommended commands:"
+        if [ "$USE_MERGED" = true ]; then
+            log_info "  Actual installation: brew-sync restore --merged"
+        elif [ -n "$TARGET_HOST" ]; then
+            log_info "  Actual installation: brew-sync restore --host $TARGET_HOST"
+        elif [ -n "$PROFILE" ]; then
+            log_info "  Actual installation: brew-sync restore --profile $PROFILE"
+        else
+            log_info "  Actual installation: brew-sync restore"
+        fi
+    fi
+}
+
+# Print usage if no arguments
+if [ $# -eq 0 ]; then
+    usage
+    exit 0
+fi
+
+# Determine action based on first argument
+case "$1" in
+    backup)
+        shift
+        do_backup "$@"
+        ;;
+    restore)
+        shift
+        do_restore "$@"
+        ;;
+    list)
+        # Auto-detect backup location for listing
+        detect_backup_location 2>/dev/null || BACKUP_DIR="$DEFAULT_BACKUP_DIR"
+        list_backups
+        ;;
+    help|--help|-h)
+        usage
+        exit 0
+        ;;
+    *)
+        log_error "Unknown command: $1"
+        echo ""
+        usage
+        exit 1
+        ;;
+esac

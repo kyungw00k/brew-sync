@@ -5,6 +5,10 @@
 
 set -e
 
+# Version and update configuration
+GITHUB_REPO="kyungwook/brew-sync"  # Update with actual repo
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+
 # Configuration
 ICLOUD_PATH="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
 # Set default backup directory based on platform
@@ -61,6 +65,7 @@ usage() {
     echo "  brew-sync backup [options]    # Backup current packages"
     echo "  brew-sync restore [options]   # Restore packages from backup"
     echo "  brew-sync list                # List available backups"
+    echo "  brew-sync update              # Update to latest version"
     echo "  brew-sync help                # Show this help"
     echo ""
     echo "Backup examples:"
@@ -913,31 +918,15 @@ do_restore() {
     log_info "  - Mac App Store apps: $MAS_COUNT"
     echo
 
-    # Handle existing Brewfile backup
-    if [ -f "Brewfile" ] && [ "$FORCE" = false ]; then
-        log_warning "Brewfile already exists in current directory."
-        echo -n "Do you want to backup the existing file and continue? (y/N): "
-        read -r response
-        if [[ ! "$response" =~ ^[Yy]$ ]]; then
-            log_info "Operation cancelled."
-            exit 0
-        fi
-        
-        local TIMESTAMP_LOCAL=$(date +"%Y%m%d_%H%M%S")
-        if [ "$DRY_RUN" = false ]; then
-            mv Brewfile "Brewfile.backup_$TIMESTAMP_LOCAL"
-            log_info "Backed up existing Brewfile: Brewfile.backup_$TIMESTAMP_LOCAL"
-        else
-            log_info "[DRY-RUN] Backing up existing Brewfile: Brewfile.backup_$TIMESTAMP_LOCAL"
-        fi
-    fi
-
-    # Copy Brewfile
+    # Create temporary directory for Brewfile
+    TEMP_BREWFILE_DIR=$(mktemp -d)
+    TEMP_BREWFILE="$TEMP_BREWFILE_DIR/Brewfile"
+    
     if [ "$DRY_RUN" = false ]; then
-        cp "$BACKUP_BREWFILE" "./Brewfile"
-        log_success "Copied Brewfile to current directory"
+        cp "$BACKUP_BREWFILE" "$TEMP_BREWFILE"
+        log_success "Copied Brewfile to temporary directory"
     else
-        log_info "[DRY-RUN] Copying Brewfile to current directory"
+        log_info "[DRY-RUN] Copying Brewfile to temporary directory"
     fi
 
     # Check Mac App Store CLI tool (mas if needed)
@@ -968,28 +957,28 @@ do_restore() {
 
     if [ "$DRY_RUN" = true ]; then
         log_info "[DRY-RUN] Running brew bundle check"
-        if brew bundle check --no-upgrade 2>/dev/null; then
+        if brew bundle check --file="$TEMP_BREWFILE" --no-upgrade 2>/dev/null; then
             log_info "[DRY-RUN] All packages are already installed"
         else
             log_info "[DRY-RUN] Packages that need installation:"
-            brew bundle check --no-upgrade 2>&1 | grep -E "^(brew|cask|mas)" | head -10
-            TOTAL_MISSING=$(brew bundle check --no-upgrade 2>&1 | grep -E "^(brew|cask|mas)" | wc -l | tr -d ' ')
+            brew bundle check --file="$TEMP_BREWFILE" --no-upgrade 2>&1 | grep -E "^(brew|cask|mas)" | head -10
+            TOTAL_MISSING=$(brew bundle check --file="$TEMP_BREWFILE" --no-upgrade 2>&1 | grep -E "^(brew|cask|mas)" | wc -l | tr -d ' ')
             if [ "$TOTAL_MISSING" -gt 10 ]; then
                 log_info "[DRY-RUN] ... and $((TOTAL_MISSING - 10)) more"
             fi
             log_info "[DRY-RUN] Following command will be executed:"
-            log_info "[DRY-RUN] brew bundle $BUNDLE_ARGS"
+            log_info "[DRY-RUN] brew bundle --file=\"$TEMP_BREWFILE\" $BUNDLE_ARGS"
         fi
     else
         # Perform actual installation
         log_info "Running brew bundle..."
         
-        if brew bundle $BUNDLE_ARGS; then
+        if brew bundle --file="$TEMP_BREWFILE" $BUNDLE_ARGS; then
             log_success "All packages installed successfully!"
         else
             log_warning "Some package installations may have failed."
             log_info "Check the output above for details."
-            log_info "Retry failed packages: brew bundle --verbose"
+            log_info "Retry failed packages: brew bundle --file=\"$TEMP_BREWFILE\" --verbose"
         fi
     fi
 
@@ -1016,9 +1005,8 @@ do_restore() {
         
         log_success "All operations completed!"
         log_info "Installed environment:"
-        log_info "  - Brewfile created in current directory"
         log_info "  - Installed packages: Homebrew($INSTALLED_BREW) Cask($INSTALLED_CASK)"
-        log_info "  - Check sync: brew bundle check"
+        log_info "  - Check sync: brew bundle check --file=\"$TEMP_BREWFILE\""
         log_info "  - Full list: brew list"
         
         # Additional restore options guidance
@@ -1044,6 +1032,126 @@ do_restore() {
             log_info "  Actual installation: brew-sync restore"
         fi
     fi
+    
+    # Cleanup temporary directory
+    if [ -n "$TEMP_BREWFILE_DIR" ] && [ -d "$TEMP_BREWFILE_DIR" ]; then
+        rm -rf "$TEMP_BREWFILE_DIR"
+        log_info "Cleaned up temporary files"
+    fi
+}
+
+# Function: Check for updates
+check_for_updates() {
+    local check_only="$1"
+    
+    log_info "Checking for updates..."
+    
+    # Get current script hash
+    local current_hash
+    current_hash=$(md5 "$SCRIPT_PATH" 2>/dev/null | cut -d' ' -f4)
+    if [ -z "$current_hash" ]; then
+        log_error "Failed to calculate current script hash."
+        return 1
+    fi
+    
+    log_info "Current script hash: ${current_hash:0:8}..."
+    
+    # Download latest version to temporary file
+    local temp_script
+    temp_script=$(mktemp)
+    if ! curl -s "https://raw.githubusercontent.com/$GITHUB_REPO/main/brew-sync" -o "$temp_script"; then
+        log_error "Failed to download latest version. Please check your internet connection."
+        rm -f "$temp_script"
+        return 1
+    fi
+    
+    # Get latest script hash
+    local latest_hash
+    latest_hash=$(md5 "$temp_script" 2>/dev/null | cut -d' ' -f4)
+    if [ -z "$latest_hash" ]; then
+        log_error "Failed to calculate latest script hash."
+        rm -f "$temp_script"
+        return 1
+    fi
+    
+    log_info "Latest script hash: ${latest_hash:0:8}..."
+    
+    # Compare hashes
+    if [ "$current_hash" = "$latest_hash" ]; then
+        log_success "You are already using the latest version!"
+        rm -f "$temp_script"
+        return 0
+    fi
+    
+    if [ "$check_only" = "--check" ]; then
+        log_info "A new version is available."
+        log_info "Run 'brew-sync update' to update."
+        rm -f "$temp_script"
+        return 0
+    fi
+    
+    # Perform update
+    log_info "New version available!"
+    echo -n "Do you want to update? (y/N): "
+    read -r response
+    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+        log_info "Update cancelled."
+        rm -f "$temp_script"
+        return 0
+    fi
+    
+    # Find current script location
+    local script_path
+    script_path=$(which brew-sync 2>/dev/null || readlink -f "$SCRIPT_PATH" 2>/dev/null || echo "$SCRIPT_PATH")
+    if [ ! -f "$script_path" ]; then
+        log_error "Could not determine script location. Please reinstall manually."
+        rm -f "$temp_script"
+        return 1
+    fi
+    
+    log_info "Updating brew-sync at: $script_path"
+    
+    # Backup current version
+    local backup_path="${script_path}.backup.$(date +%Y%m%d_%H%M%S)"
+    if ! cp "$script_path" "$backup_path"; then
+        log_error "Failed to backup current version."
+        rm -f "$temp_script"
+        return 1
+    fi
+    
+    # Replace script (may require sudo)
+    if cp "$temp_script" "$script_path" 2>/dev/null; then
+        log_success "Update completed successfully!"
+    elif sudo cp "$temp_script" "$script_path" 2>/dev/null; then
+        log_success "Update completed successfully! (required sudo)"
+    else
+        log_error "Failed to update script. Restoring backup..."
+        cp "$backup_path" "$script_path" 2>/dev/null || sudo cp "$backup_path" "$script_path"
+        rm -f "$temp_script" "$backup_path"
+        return 1
+    fi
+    
+    # Set executable permission and cleanup
+    chmod +x "$script_path" 2>/dev/null || sudo chmod +x "$script_path"
+    rm -f "$temp_script" "$backup_path"
+    
+    # Verify update
+    local new_hash
+    new_hash=$(md5 "$script_path" 2>/dev/null | cut -d' ' -f4)
+    log_success "Updated successfully!"
+    log_info "Previous: ${current_hash:0:8}... → Current: ${new_hash:0:8}..."
+}
+
+# Function: Show version
+show_version() {
+    local script_hash
+    script_hash=$(md5 "$SCRIPT_PATH" 2>/dev/null | cut -d' ' -f4)
+    local mod_date
+    mod_date=$(stat -f %Sm -t "%Y-%m-%d %H:%M" "$SCRIPT_PATH" 2>/dev/null || echo "unknown")
+    
+    echo "brew-sync"
+    echo "Script hash: ${script_hash:0:8}..."
+    echo "Modified: $mod_date"
 }
 
 # Print usage if no arguments
@@ -1066,6 +1174,14 @@ case "$1" in
         # Auto-detect backup location for listing
         detect_backup_location 2>/dev/null || BACKUP_DIR="$DEFAULT_BACKUP_DIR"
         list_backups
+        ;;
+    update)
+        shift
+        check_for_updates "$@"
+        ;;
+    version|--version|-v)
+        show_version
+        exit 0
         ;;
     help|--help|-h)
         usage

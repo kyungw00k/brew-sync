@@ -6,7 +6,7 @@
 set -e
 
 # Version and update configuration
-GITHUB_REPO="kyungwook/brew-sync"  # Update with actual repo
+GITHUB_REPO="kyungw00k/brew-sync"  # Update with actual repo
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 
 # Configuration

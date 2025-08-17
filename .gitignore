@@ -11,6 +11,9 @@ Brewfile.*
 *.swo
 *~
 
+hosts/
+merged/
+
 # Local backup directories
 .brew-backup/
 

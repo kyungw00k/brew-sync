@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # brew-sync: Homebrew package synchronization tool
-# Usage: brew-sync [backup|restore|list|help] [options]
+# Usage: brew-sync [backup|restore|list|update|uninstall|help] [options]
 
 set -e
 
@@ -11,13 +11,16 @@ SCRIPT_PATH="${BASH_SOURCE[0]}"
 
 # Configuration
 ICLOUD_PATH="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
+BREW_SYNC_CONFIG_DIR="$HOME/.config/brew-sync"
+LAST_STORAGE_FILE="$BREW_SYNC_CONFIG_DIR/last_storage"
 # Set default backup directory based on platform
+BREW_SYNC_LOCAL_DIR="$HOME/.brew-sync"
 if [[ "$OSTYPE" == "darwin"* ]]; then
-    # macOS - use iCloud as default
+    # macOS - use iCloud as default (but allow first-time choice)
     DEFAULT_BACKUP_DIR="$ICLOUD_PATH/brew-backup"
 else
-    # Other platforms - use ~/.config/brew-sync
-    DEFAULT_BACKUP_DIR="$HOME/.config/brew-sync"
+    # Other platforms - use local .brew-sync
+    DEFAULT_BACKUP_DIR="$BREW_SYNC_LOCAL_DIR"
 fi
 BREWFILE_NAME="Brewfile"
 HOSTNAME=$(hostname -s)
@@ -57,6 +60,281 @@ log_restore() {
     echo -e "${CYAN}→${NC} $1"
 }
 
+# Function: Detect all available storage locations
+detect_all_storages() {
+    local -a storages=()
+    
+    # 1. Check Git repository
+    if git rev-parse --git-dir &>/dev/null; then
+        local git_path
+        git_path="$(git rev-parse --show-toplevel)"
+        storages+=("git|$git_path|Git Repository")
+    fi
+    
+    # 2. Check iCloud Drive (macOS only)
+    if [[ "$OSTYPE" == "darwin"* ]] && [ -d "$ICLOUD_PATH" ]; then
+        storages+=("icloud|$DEFAULT_BACKUP_DIR|iCloud Drive")
+    fi
+    
+    # 2.5. Always add local storage option
+    storages+=("local|$BREW_SYNC_LOCAL_DIR|Local storage (.brew-sync)")
+    
+    # 3. Check Dropbox
+    for dropbox_path in "$HOME/Dropbox" "$HOME/Library/CloudStorage/Dropbox-"*; do
+        if [ -d "$dropbox_path" ]; then
+            storages+=("dropbox|$dropbox_path/brew-backup|Dropbox")
+            break
+        fi
+    done
+    
+    # 4. Check Google Drive
+    for gdrive_path in "$HOME/Google Drive" "$HOME/Library/CloudStorage/GoogleDrive-"*; do
+        if [ -d "$gdrive_path" ]; then
+            storages+=("google-drive|$gdrive_path/brew-backup|Google Drive")
+            break
+        fi
+    done
+    
+    # 5. Check OneDrive
+    for onedrive_path in "$HOME/OneDrive" "$HOME/Library/CloudStorage/OneDrive-"*; do
+        if [ -d "$onedrive_path" ]; then
+            storages+=("onedrive|$onedrive_path/brew-backup|OneDrive")
+            break
+        fi
+    done
+    
+    # Return the array (each element is "method|path|display_name")
+    printf '%s\n' "${storages[@]}"
+}
+
+# Function: Save last used storage
+save_last_storage() {
+    local method="$1"
+    local path="$2"
+    
+    # Create config directory if it doesn't exist
+    mkdir -p "$BREW_SYNC_CONFIG_DIR"
+    
+    # Save storage info (quote path to handle spaces)
+    echo "method=$method" > "$LAST_STORAGE_FILE"
+    echo "path=\"$path\"" >> "$LAST_STORAGE_FILE"
+    echo "timestamp=$(date +%s)" >> "$LAST_STORAGE_FILE"
+}
+
+# Function: Load last used storage
+load_last_storage() {
+    if [ -f "$LAST_STORAGE_FILE" ]; then
+        local method path timestamp
+        eval "$(grep -E '^(method|path|timestamp)=' "$LAST_STORAGE_FILE")"
+        
+        # Check if the path still exists
+        if [ -n "$method" ] && [ -n "$path" ]; then
+            case "$method" in
+                git)
+                    if git -C "$path" rev-parse --git-dir &>/dev/null; then
+                        echo "$method|$path"
+                        return 0
+                    fi
+                    ;;
+                *)
+                    local check_path="$path"
+                    if [ "$method" = "icloud" ]; then
+                        check_path="$ICLOUD_PATH"
+                    fi
+                    if [ -d "${check_path%/brew-backup}" ]; then
+                        echo "$method|$path"
+                        return 0
+                    fi
+                    ;;
+            esac
+        fi
+    fi
+    return 1
+}
+
+# Function: First-time setup for storage selection
+first_time_setup() {
+    echo ""
+    log_info "🍺 Welcome to brew-sync!"
+    echo ""
+    echo "Choose your backup storage location:"
+    echo ""
+    
+    # Get available storages
+    local -a storages
+    while IFS= read -r line; do
+        storages+=("$line")
+    done < <(detect_all_storages)
+    
+    # Display options with descriptions
+    local i=1
+    local recommended_index=0
+    for storage in "${storages[@]}"; do
+        local method="${storage%%|*}"
+        local path="${storage#*|}"
+        local display_name="${path##*|}"
+        path="${path%|*}"
+        
+        case "$method" in
+            icloud)
+                echo "  $i) $display_name (recommended for multiple Macs)" >&2
+                echo "     📱 Syncs automatically across your Macs" >&2
+                echo "     📂 $path" >&2
+                if [[ "$OSTYPE" == "darwin"* ]]; then
+                    recommended_index=$i
+                fi
+                ;;
+            local)
+                echo "  $i) $display_name" >&2
+                echo "     💻 Stays on this Mac only" >&2
+                echo "     📂 $path" >&2
+                if [[ "$OSTYPE" != "darwin"* ]]; then
+                    recommended_index=$i
+                fi
+                ;;
+            git)
+                echo "  $i) $display_name" >&2
+                echo "     🔄 Version control and manual sync" >&2
+                echo "     📂 $path" >&2
+                ;;
+            *)
+                echo "  $i) $display_name" >&2
+                echo "     ☁️  Cloud storage service" >&2
+                echo "     📂 $path" >&2
+                ;;
+        esac
+        echo "" >&2
+        ((i++))
+    done
+    
+    echo -n "Select storage (1-${#storages[@]}, press Enter for $recommended_index): " >&2
+    read -r choice
+    
+    # Handle empty input
+    if [ -z "$choice" ]; then
+        choice=$recommended_index
+        log_info "Using recommended option: $choice" >&2
+    # Validate choice
+    elif ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#storages[@]} ]; then
+        log_error "Invalid selection. Using recommended option." >&2
+        choice=$recommended_index
+    fi
+    
+    # Return selected storage
+    local selected="${storages[$((choice-1))]}"
+    local method="${selected%%|*}"
+    local path="${selected#*|}"
+    path="${path%|*}"
+    
+    # Save selection
+    save_last_storage "$method" "$path"
+    
+    echo ""
+    log_success "Storage configured: $method ($path)" >&2
+    echo "$method|$path"
+}
+
+# Function: Interactive storage selection
+select_storage_interactive() {
+    local -a storages
+    local last_index=0
+    while IFS= read -r line; do
+        storages+=("$line")
+    done < <(detect_all_storages)
+    
+    
+    if [ ${#storages[@]} -eq 0 ]; then
+        log_warning "No cloud storage services detected."
+        log_info "Using default local backup: $DEFAULT_BACKUP_DIR"
+        echo "local|$DEFAULT_BACKUP_DIR"
+        return 0
+    fi
+    
+    if [ ${#storages[@]} -eq 1 ]; then
+        # Only one storage available, use it
+        local storage="${storages[0]}"
+        local method="${storage%%|*}"
+        local path="${storage#*|}"
+        path="${path%|*}"
+        echo "$method|$path"
+        return 0
+    fi
+    
+    # Multiple storages available, show selection menu
+    echo "" >&2
+    log_info "Multiple cloud storage services detected:" >&2
+    echo "" >&2
+    
+    local i=1
+    for storage in "${storages[@]}"; do
+        local method="${storage%%|*}"
+        local path="${storage#*|}"
+        local display_name="${path##*|}"
+        path="${path%|*}"
+        echo "  $i) $display_name ($path)" >&2
+        ((i++))
+    done
+    
+    # Check for last used storage
+    local last_storage
+    if last_storage=$(load_last_storage); then
+        local last_method="${last_storage%%|*}"
+        local last_path="${last_storage#*|}"
+        
+        # Find the index of last used storage
+        local j=1
+        for storage in "${storages[@]}"; do
+            local storage_method="${storage%%|*}"
+            local storage_path="${storage#*|}"
+            storage_path="${storage_path%|*}"
+            if [ "$storage_method" = "$last_method" ] && [ "$storage_path" = "$last_path" ]; then
+                last_index=$j
+                break
+            fi
+            ((j++))
+        done
+        
+        if [ $last_index -gt 0 ]; then
+            echo "" >&2
+            log_info "Last used: Option $last_index" >&2
+        fi
+    fi
+    
+    echo "" >&2
+    if [ $last_index -gt 0 ]; then
+        echo -n "Select storage location (1-${#storages[@]}, press Enter for $last_index): " >&2
+    else
+        echo -n "Select storage location (1-${#storages[@]}, press Enter for 1): " >&2
+    fi
+    read -r choice
+    
+    # Handle empty input - show default option
+    if [ -z "$choice" ]; then
+        if [ $last_index -gt 0 ]; then
+            choice=$last_index
+            log_info "Using last used option: $choice" >&2
+        else
+            choice=1
+            log_info "Using default option: $choice" >&2
+        fi
+    # Validate choice
+    elif ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#storages[@]} ]; then
+        log_error "Invalid selection. Using first available option." >&2
+        choice=1
+    fi
+    
+    # Return selected storage
+    local selected="${storages[$((choice-1))]}"
+    local method="${selected%%|*}"
+    local path="${selected#*|}"
+    path="${path%|*}"
+    
+    # Save selection for next time
+    save_last_storage "$method" "$path"
+    
+    echo "$method|$path"
+}
+
 # Function: Print main usage
 usage() {
     echo "brew-sync: Homebrew package synchronization tool"
@@ -66,6 +344,7 @@ usage() {
     echo "  brew-sync restore [options]   # Restore packages from backup"
     echo "  brew-sync list                # List available backups"
     echo "  brew-sync update              # Update to latest version"
+    echo "  brew-sync uninstall           # Uninstall brew-sync"
     echo "  brew-sync help                # Show this help"
     echo ""
     echo "Backup examples:"
@@ -82,10 +361,35 @@ usage() {
     echo "For detailed options, add --help to each command:"
     echo "  brew-sync backup --help"
     echo "  brew-sync restore --help"
+    echo "  brew-sync update --help"
+    echo ""
+    echo "Note: Use --select-storage to change your default storage location."
 }
 
 # Function: Print backup usage
 backup_usage() {
+    echo "Usage: brew-sync backup [options]"
+    echo ""
+    echo "Common options:"
+    echo "  -p, --profile NAME   Use profile (e.g., dev, design)"
+    echo "  --select-storage     Choose storage location interactively (**saves as default**)"
+    echo "  --git                Backup to Git repository (temporary)"
+    echo "  --icloud             Backup to iCloud Drive (temporary)"
+    echo "  --dropbox            Backup to Dropbox (temporary)"
+    echo "  --path PATH          Backup to custom path (temporary)"
+    echo ""
+    echo "Examples:"
+    echo "  brew-sync backup                    # Auto-detect best location"
+    echo "  brew-sync backup --git              # Use Git repository once"
+    echo "  brew-sync backup --select-storage   # Choose and save as default"
+    echo "  brew-sync backup -p dev             # Backup dev profile"
+    echo ""
+    echo "Note: Only --select-storage changes your default. Other options are temporary."
+    echo "For all options: brew-sync backup --help-all"
+}
+
+# Function: Print backup usage (full)
+backup_usage_full() {
     echo "Usage: brew-sync backup [options]"
     echo ""
     echo "Backup location options:"
@@ -103,8 +407,12 @@ backup_usage() {
     echo "Backup options:"
     echo "  -p, --profile NAME   Specify profile name (e.g., dev, design)"
     echo "  --no-merge          Disable merge functionality"
+    echo "  --select-storage    **Interactively choose storage location (saves as new default)**"
     echo "  --auto-detect       Auto-detect optimal backup location (default)"
     echo "  -h, --help          Show this help"
+    echo ""
+    echo "**IMPORTANT**: Only --select-storage changes your default storage setting."
+    echo "              Other location options are temporary for this backup only."
     echo ""
     echo "Examples:"
     echo "  brew-sync backup                           # Auto-detect optimal location"
@@ -118,6 +426,36 @@ backup_usage() {
 restore_usage() {
     echo "Usage: brew-sync restore [options]"
     echo ""
+    echo "What to restore:"
+    echo "  (default)            Current Mac's backup"
+    echo "  --merged             All Macs combined"
+    echo "  --host HOSTNAME      Specific Mac's backup"
+    echo "  -p, --profile NAME   Specific profile"
+    echo ""
+    echo "Where to restore from:"
+    echo "  (default)            Last used storage location"
+    echo "  --select-storage     Choose location interactively (**saves as default**)"
+    echo "  --git, --icloud      Temporary: use specific storage"
+    echo "  --dropbox, --path    Temporary: use specific storage"
+    echo ""
+    echo "Other options:"
+    echo "  -d, --dry-run        Preview only (recommended first)"
+    echo "  -l, --list           List available backups"
+    echo ""
+    echo "Examples:"
+    echo "  brew-sync restore --dry-run         # Preview your backup"
+    echo "  brew-sync restore                   # Restore your backup"
+    echo "  brew-sync restore --merged          # Restore from all Macs"
+    echo "  brew-sync restore --host MacBook    # Restore from MacBook"
+    echo ""
+    echo "Note: Only --select-storage changes your default. Other options are temporary."
+    echo "For all options: brew-sync restore --help-all"
+}
+
+# Function: Print restore usage (full)
+restore_usage_full() {
+    echo "Usage: brew-sync restore [options]"
+    echo ""
     echo "Backup source options:"
     echo "  --icloud               Restore from iCloud Drive"
     echo "  --git                  Restore from Git repository"
@@ -125,6 +463,7 @@ restore_usage() {
     echo "  --google-drive         Restore from Google Drive"
     echo "  --path PATH            Restore from custom path"
     echo "  --usb VOLUME           Restore from USB drive"
+    echo "  --select-storage       **Interactively choose storage location (saves as new default)**"
     echo "  --auto-detect          Auto-detect optimal backup location (default)"
     echo ""
     echo "Restore type options (select one):"
@@ -141,6 +480,9 @@ restore_usage() {
     echo "  -l, --list             List available backups"
     echo "  -h, --help             Show this help"
     echo ""
+    echo "**IMPORTANT**: Only --select-storage changes your default storage setting."
+    echo "              Other source options are temporary for this restore only."
+    echo ""
     echo "Examples:"
     echo "  brew-sync restore                     # Auto-detect and restore current Mac backup"
     echo "  brew-sync restore --git --merged      # Restore from Git repository merged packages"
@@ -148,67 +490,95 @@ restore_usage() {
     echo "  brew-sync restore --path ~/backup -p dev --merged  # Restore from custom path dev profile merged"
 }
 
-# Function: Auto-detect optimal backup location
+# Function: Auto-detect backup location with smart selection
 detect_backup_location() {
-    local detected_path=""
-    local method=""
+    local interactive_mode="$1"  # "interactive" or empty for auto-detect
     
-    # 1. Check Git repository (highest priority)
-    if git rev-parse --git-dir &>/dev/null; then
-        detected_path="$(git rev-parse --show-toplevel)"
-        method="git"
-        log_info "Git repository detected: $detected_path"
-        BACKUP_DIR="$detected_path"
+    # Check for first-time setup (no config file exists)
+    if [ ! -f "$LAST_STORAGE_FILE" ] && [ "$interactive_mode" != "interactive" ]; then
+        log_info "First time running brew-sync..."
+        local selection
+        selection=$(first_time_setup)
+        local method="${selection%%|*}"
+        local path="${selection#*|}"
+        
+        BACKUP_DIR="$path"
         BACKUP_METHOD="$method"
         return 0
     fi
     
-    # 2. Check iCloud Drive (macOS only)
-    if [[ "$OSTYPE" == "darwin"* ]] && [ -d "$ICLOUD_PATH" ]; then
-        detected_path="$DEFAULT_BACKUP_DIR"
-        method="icloud"
-        log_info "iCloud Drive detected: $detected_path"
-        BACKUP_DIR="$detected_path"
+    # Try to use last used storage if available (but not in interactive mode)
+    local last_storage
+    if [ "$interactive_mode" != "interactive" ] && last_storage=$(load_last_storage); then
+        local method="${last_storage%%|*}"
+        local path="${last_storage#*|}"
+        
+        log_info "Using last saved storage: $method ($path)"
+        BACKUP_DIR="$path"
         BACKUP_METHOD="$method"
         return 0
     fi
     
-    # 3. Check Dropbox
-    for dropbox_path in "$HOME/Dropbox" "$HOME/Library/CloudStorage/Dropbox-*"; do
-        if [ -d "$dropbox_path" ]; then
-            detected_path="$dropbox_path/brew-backup"
-            method="dropbox"
-            log_info "Dropbox detected: $detected_path"
-            BACKUP_DIR="$detected_path"
-            BACKUP_METHOD="$method"
-            return 0
-        fi
-    done
+    # Get all available storages
+    local -a storages
+    while IFS= read -r line; do
+        storages+=("$line")
+    done < <(detect_all_storages)
     
-    # 4. Check Google Drive
-    for gdrive_path in "$HOME/Google Drive" "$HOME/Library/CloudStorage/GoogleDrive-*"; do
-        if [ -d "$gdrive_path" ]; then
-            detected_path="$gdrive_path/brew-backup"
-            method="google-drive"
-            log_info "Google Drive detected: $detected_path"
-            BACKUP_DIR="$detected_path"
-            BACKUP_METHOD="$method"
-            return 0
-        fi
-    done
-    
-    # 5. Use platform-specific default directory
-    detected_path="$DEFAULT_BACKUP_DIR"
-    method="local"
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        log_warning "No cloud service found, using local backup: $detected_path"
-    else
-        log_info "Using default backup location: $detected_path"
+    if [ ${#storages[@]} -eq 0 ]; then
+        # No cloud storage detected, use local default
+        log_warning "No cloud storage services detected."
+        log_info "Using default local backup: $DEFAULT_BACKUP_DIR"
+        BACKUP_DIR="$DEFAULT_BACKUP_DIR"
+        BACKUP_METHOD="local"
+        return 0
     fi
     
-    # Set global variables
-    BACKUP_DIR="$detected_path"
-    BACKUP_METHOD="$method"
+    if [ ${#storages[@]} -eq 1 ] && [ "$interactive_mode" != "interactive" ]; then
+        # Only one storage available, use it automatically
+        local storage="${storages[0]}"
+        local method="${storage%%|*}"
+        local path="${storage#*|}"
+        path="${path%|*}"
+        local display_name="${storage##*|}"
+        
+        log_info "$display_name detected: $path"
+        BACKUP_DIR="$path"
+        BACKUP_METHOD="$method"
+        
+        # Save this choice for future use
+        save_last_storage "$method" "$path"
+        return 0
+    fi
+    
+    # Multiple storages available or interactive mode requested
+    if [ "$interactive_mode" = "interactive" ] || [ ${#storages[@]} -gt 1 ]; then
+        local selection
+        selection=$(select_storage_interactive)
+        local method="${selection%%|*}"
+        local path="${selection#*|}"
+        
+        local display_name=""
+        for storage in "${storages[@]}"; do
+            local storage_method="${storage%%|*}"
+            local storage_path="${storage#*|}"
+            storage_path="${storage_path%|*}"
+            if [ "$storage_method" = "$method" ] && [ "$storage_path" = "$path" ]; then
+                display_name="${storage##*|}"
+                break
+            fi
+        done
+        
+        log_info "Selected: $display_name ($path)"
+        BACKUP_DIR="$path"
+        BACKUP_METHOD="$method"
+        return 0
+    fi
+    
+    # Fallback to local default
+    log_warning "Using default local backup: $DEFAULT_BACKUP_DIR"
+    BACKUP_DIR="$DEFAULT_BACKUP_DIR"
+    BACKUP_METHOD="local"
 }
 
 # Function: Handle Git backup
@@ -312,6 +682,7 @@ do_backup() {
     local CUSTOM_PATH=""
     local USE_GIT=false
     local AUTO_DETECT=true
+    local INTERACTIVE_STORAGE=false
 
     # Parse backup arguments
     while [[ $# -gt 0 ]]; do
@@ -322,6 +693,11 @@ do_backup() {
                 ;;
             --no-merge)
                 MERGE_MODE=false
+                shift
+                ;;
+            --select-storage)
+                INTERACTIVE_STORAGE=true
+                AUTO_DETECT=false
                 shift
                 ;;
             --icloud)
@@ -382,6 +758,10 @@ do_backup() {
                 backup_usage
                 exit 0
                 ;;
+            --help-all)
+                backup_usage_full
+                exit 0
+                ;;
             *)
                 log_error "Unknown backup option: $1"
                 backup_usage
@@ -396,6 +776,8 @@ do_backup() {
     elif [ -n "$CUSTOM_PATH" ]; then
         BACKUP_DIR="$CUSTOM_PATH"
         BACKUP_METHOD="custom"
+    elif [ "$INTERACTIVE_STORAGE" = true ]; then
+        detect_backup_location "interactive"
     elif [ "$AUTO_DETECT" = true ]; then
         detect_backup_location
     else
@@ -503,6 +885,9 @@ EOF
     log_success "[$HOSTNAME] Backup completed!"
     log_info "Backup location: $HOST_BREWFILE"
     log_info "Package statistics: Homebrew($BREW_COUNT) Cask($CASK_COUNT) MAS($MAS_COUNT)"
+    
+    # Save the successful backup storage choice for future use
+    save_last_storage "$BACKUP_METHOD" "$BACKUP_DIR"
 
     # Perform merge operation
     if [ "$MERGE_MODE" = true ] && [ "$CHANGES_DETECTED" = true ]; then
@@ -694,6 +1079,7 @@ do_restore() {
     local CUSTOM_PATH=""
     local USE_GIT=false
     local AUTO_DETECT=true
+    local INTERACTIVE_STORAGE=false
 
     # Parse restore arguments
     while [[ $# -gt 0 ]]; do
@@ -786,8 +1172,17 @@ do_restore() {
                 AUTO_DETECT=false
                 shift 2
                 ;;
+            --select-storage)
+                INTERACTIVE_STORAGE=true
+                AUTO_DETECT=false
+                shift
+                ;;
             -h|--help)
                 restore_usage
+                exit 0
+                ;;
+            --help-all)
+                restore_usage_full
                 exit 0
                 ;;
             *)
@@ -804,6 +1199,8 @@ do_restore() {
     elif [ -n "$CUSTOM_PATH" ]; then
         BACKUP_DIR="$CUSTOM_PATH"
         BACKUP_METHOD="custom"
+    elif [ "$INTERACTIVE_STORAGE" = true ]; then
+        detect_backup_location "interactive"
     elif [ "$AUTO_DETECT" = true ]; then
         detect_backup_location
     else
@@ -1040,9 +1437,78 @@ do_restore() {
     fi
 }
 
+# Function: Print update usage
+update_usage() {
+    echo "Usage: brew-sync update [options]"
+    echo ""
+    echo "Options:"
+    echo "  --check              Check for updates without installing"
+    echo "  --help, -h           Show this help message"
+    echo ""
+    echo "Examples:"
+    echo "  brew-sync update                # Update to latest version"
+    echo "  brew-sync update --check        # Check if update is available"
+    echo ""
+    echo "The update command compares the current version with the latest"
+    echo "version from GitHub and updates if a newer version is available."
+}
+
+# Function: Uninstall brew-sync
+uninstall_brew_sync() {
+    log_info "Uninstalling brew-sync..."
+    
+    # Determine installation directory
+    local install_dir="/usr/local/bin"
+    if [[ $(uname -m) == "arm64" ]]; then
+        install_dir="/opt/homebrew/bin"
+    fi
+    
+    local script_path="$install_dir/brew-sync"
+    
+    # Check if the script exists
+    if [ ! -f "$script_path" ]; then
+        log_error "brew-sync is not installed at $script_path"
+        return 1
+    fi
+    
+    # Ask for confirmation
+    echo ""
+    log_warning "This will remove brew-sync from your system."
+    echo -n "Are you sure you want to continue? (y/N): "
+    read -r response
+    
+    case "$response" in
+        [yY][eE][sS]|[yY])
+            # Remove the script
+            if [ -w "$install_dir" ]; then
+                rm -f "$script_path"
+                log_success "brew-sync has been uninstalled successfully"
+            else
+                sudo rm -f "$script_path"
+                log_success "brew-sync has been uninstalled successfully (with sudo)"
+            fi
+            
+            log_info "Note: Your backup files remain untouched."
+            log_info "If you want to remove backup files, manually delete them from:"
+            log_info "  - iCloud Drive: ~/Library/Mobile Documents/com~apple~CloudDocs/brew-backup"
+            log_info "  - Other locations you may have configured"
+            ;;
+        *)
+            log_info "Uninstall cancelled."
+            return 0
+            ;;
+    esac
+}
+
 # Function: Check for updates
 check_for_updates() {
     local check_only="$1"
+    
+    # Handle help option
+    if [ "$check_only" = "--help" ] || [ "$check_only" = "-h" ]; then
+        update_usage
+        exit 0
+    fi
     
     log_info "Checking for updates..."
     
@@ -1178,6 +1644,10 @@ case "$1" in
     update)
         shift
         check_for_updates "$@"
+        ;;
+    uninstall)
+        shift
+        uninstall_brew_sync "$@"
         ;;
     version|--version|-v)
         show_version

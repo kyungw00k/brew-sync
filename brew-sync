@@ -27,6 +27,14 @@ HOSTNAME=$(hostname -s)
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 CURRENT_HOSTNAME=$(hostname -s)
 
+# Profile configuration
+DEFAULT_PROFILE="default"
+PROFILE=""
+PROFILES_DIR="profiles"
+MIGRATION_DIR=".migration"
+MIGRATION_FLAG="migrated"
+HOSTS_DIR="hosts"
+
 # Color settings
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -58,6 +66,540 @@ log_merge() {
 
 log_restore() {
     echo -e "${CYAN}→${NC} $1"
+}
+
+# Migration functions
+
+# Function: Check if migration is needed from hosts to profiles
+check_migration_needed() {
+    local backup_dir="$1"
+    local migration_flag_file="$backup_dir/$MIGRATION_DIR/$MIGRATION_FLAG"
+    local hosts_dir="$backup_dir/$HOSTS_DIR"
+    
+    # If migration flag exists, no migration needed
+    if [ -f "$migration_flag_file" ]; then
+        return 1
+    fi
+    
+    # If hosts directory exists, migration is needed
+    if [ -d "$hosts_dir" ] && [ -n "$(ls -A "$hosts_dir" 2>/dev/null)" ]; then
+        return 0
+    fi
+    
+    # No migration needed
+    return 1
+}
+
+# Function: Suggest profile name from hostname
+suggest_profile_name() {
+    local hostname="$1"
+    
+    # Extract user-defined part before machine type
+    if [[ "$hostname" =~ ^([A-Za-z]+)-(MacBook|iMac|Mini) ]]; then
+        echo "${BASH_REMATCH[1],,}"  # lowercase
+        return
+    fi
+    
+    # Machine type based suggestions
+    case "$hostname" in
+        *MacBook*|*Macbook*) echo "macbook" ;;
+        *iMac*|*imac*)       echo "imac" ;;
+        *Mini*|*mini*)       echo "mini" ;;
+        *)                   echo "machine" ;;
+    esac
+}
+
+# Function: Validate profile name
+validate_profile_name() {
+    local profile_name="$1"
+    
+    # Check if profile name is empty
+    if [ -z "$profile_name" ]; then
+        return 1
+    fi
+    
+    # Check for invalid characters (only allow alphanumeric, dash, underscore)
+    if [[ ! "$profile_name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        return 1
+    fi
+    
+    # Check for reserved names
+    case "$profile_name" in
+        "hosts"|"merged"|"common"|"."|".."|".migration")
+            return 1
+            ;;
+    esac
+    
+    # Check length (max 50 characters)
+    if [ ${#profile_name} -gt 50 ]; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# Function: Get available profiles
+get_available_profiles() {
+    local backup_dir="$1"
+    local profiles_dir="$backup_dir/$PROFILES_DIR"
+    
+    if [ ! -d "$profiles_dir" ]; then
+        return 1
+    fi
+    
+    local -a profiles=()
+    for profile_dir in "$profiles_dir"/*; do
+        if [ -d "$profile_dir" ] && [ -f "$profile_dir/Brewfile" ]; then
+            local profile_name
+            profile_name=$(basename "$profile_dir")
+            profiles+=("$profile_name")
+        fi
+    done
+    
+    if [ ${#profiles[@]} -eq 0 ]; then
+        return 1
+    fi
+    
+    printf '%s\n' "${profiles[@]}"
+    return 0
+}
+
+# Function: Get profile path
+get_profile_path() {
+    local backup_dir="$1"
+    local profile="${2:-$DEFAULT_PROFILE}"
+    echo "$backup_dir/$PROFILES_DIR/$profile"
+}
+
+# Function: Backup original host data before migration
+backup_original_data() {
+    local backup_dir="$1"
+    local hosts_dir="$backup_dir/$HOSTS_DIR"
+    local migration_backup_dir="$backup_dir/$MIGRATION_DIR/backup"
+    
+    if [ -d "$hosts_dir" ]; then
+        log_info "Backing up original host data..."
+        mkdir -p "$migration_backup_dir"
+        cp -r "$hosts_dir" "$migration_backup_dir/" 2>/dev/null || {
+            log_error "Failed to backup original data"
+            return 1
+        }
+        log_success "Original data backed up to $migration_backup_dir"
+    fi
+    return 0
+}
+
+# Function: Create migration completion flag
+create_migration_flag() {
+    local backup_dir="$1"
+    local migration_flag_file="$backup_dir/$MIGRATION_DIR/$MIGRATION_FLAG"
+    
+    mkdir -p "$(dirname "$migration_flag_file")"
+    echo "Migration completed on $(date)" > "$migration_flag_file"
+    log_success "Migration flag created"
+}
+
+# Function: Migrate single host to default profile
+migrate_single_host() {
+    local backup_dir="$1"
+    local hosts_dir="$backup_dir/$HOSTS_DIR"
+    local profiles_dir="$backup_dir/$PROFILES_DIR"
+    local default_profile_dir="$profiles_dir/$DEFAULT_PROFILE"
+    
+    log_info "Found single host backup, migrating to 'default' profile..."
+    
+    # Find the single host directory
+    local host_dir
+    host_dir=$(find "$hosts_dir" -maxdepth 1 -type d ! -path "$hosts_dir" | head -1)
+    
+    if [ -z "$host_dir" ]; then
+        log_error "No host directory found"
+        return 1
+    fi
+    
+    local hostname
+    hostname=$(basename "$host_dir")
+    
+    # Create profile directory
+    mkdir -p "$default_profile_dir"
+    
+    # Move Brewfile
+    if [ -f "$host_dir/Brewfile" ]; then
+        cp "$host_dir/Brewfile" "$default_profile_dir/Brewfile" || {
+            log_error "Failed to copy Brewfile"
+            return 1
+        }
+    fi
+    
+    # Create metadata
+    cat > "$default_profile_dir/metadata.json" <<EOF
+{
+    "profile": "$DEFAULT_PROFILE",
+    "created_from_host": "$hostname",
+    "migration_date": "$(date -Iseconds)",
+    "original_path": "$host_dir"
+}
+EOF
+    
+    log_success "Migrated $hostname to 'default' profile"
+    return 0
+}
+
+# Function: Interactive migration for two hosts
+# Helper: Get host statistics for migration UI
+get_host_stats() {
+    local host_dir="$1"
+    local pkg_count=0
+    local backup_date="unknown"
+    
+    if [ -f "$host_dir/Brewfile" ]; then
+        pkg_count=$(grep -c "^brew\|^cask\|^mas" "$host_dir/Brewfile" 2>/dev/null || echo "0")
+        backup_date=$(stat -f %Sm -t "%Y-%m-%d" "$host_dir/Brewfile" 2>/dev/null || echo "unknown")
+    fi
+    
+    echo "$pkg_count|$backup_date"
+}
+
+# Helper: Display migration options for two hosts
+display_two_host_migration_menu() {
+    local host1_name="$1"
+    local host2_name="$2"
+    local host1_pkgs="$3"
+    local host2_pkgs="$4"
+    local host1_date="$5"
+    local host2_date="$6"
+    
+    echo
+    log_info "Profile Migration Setup"
+    echo
+    echo "Found 2 existing backups:"
+    printf "┌──────────────────┬──────────┬─────────────┐\n"
+    printf "│ %-16s │ %-8s │ %-11s │\n" "Host" "Packages" "Last Backup"
+    printf "├──────────────────┼──────────┼─────────────┤\n"
+    printf "│ %-16s │ %-8s │ %-11s │\n" "$host1_name" "$host1_pkgs pkgs" "$host1_date"
+    printf "│ %-16s │ %-8s │ %-11s │\n" "$host2_name" "$host2_pkgs pkgs" "$host2_date"
+    printf "└──────────────────┴──────────┴─────────────┘\n"
+    echo
+    echo "Choose migration strategy:"
+    echo "1) 🔄 Merge into 'default' profile (recommended)"
+    echo
+    echo "2) 📁 Keep as separate profiles"
+    echo "   Which should be your main 'default' profile?"
+    echo "   a) $host1_name ($host1_pkgs packages, $host1_date)"
+    echo "   b) $host2_name ($host2_pkgs packages, $host2_date)"
+    echo
+    echo -n "Choice (1/2a/2b): "
+}
+
+# Helper: Merge two hosts into default profile
+migrate_merge_hosts() {
+    local host1_dir="$1"
+    local host2_dir="$2"
+    local host1_name="$3"
+    local host2_name="$4"
+    local profiles_dir="$5"
+    
+    log_info "Merging both hosts into 'default' profile..."
+    mkdir -p "$profiles_dir/$DEFAULT_PROFILE"
+    
+    # Merge Brewfiles
+    {
+        echo "# Merged from $host1_name and $host2_name"
+        echo "# Migration date: $(date)"
+        echo
+        [ -f "$host1_dir/Brewfile" ] && cat "$host1_dir/Brewfile"
+        echo
+        [ -f "$host2_dir/Brewfile" ] && cat "$host2_dir/Brewfile"
+    } | sort -u > "$profiles_dir/$DEFAULT_PROFILE/Brewfile"
+    
+    # Create metadata
+    cat > "$profiles_dir/$DEFAULT_PROFILE/metadata.json" <<EOF
+{
+    "profile": "$DEFAULT_PROFILE",
+    "created_from_hosts": ["$host1_name", "$host2_name"],
+    "migration_date": "$(date -Iseconds)",
+    "migration_type": "merged"
+}
+EOF
+    log_success "Merged both hosts into 'default' profile"
+}
+
+# Helper: Create separate profiles with one as default
+migrate_separate_hosts() {
+    local default_host_dir="$1"
+    local other_host_dir="$2"
+    local default_host_name="$3"
+    local other_host_name="$4"
+    local profiles_dir="$5"
+    
+    log_info "Setting $default_host_name as 'default' profile..."
+    mkdir -p "$profiles_dir/$DEFAULT_PROFILE"
+    [ -f "$default_host_dir/Brewfile" ] && cp "$default_host_dir/Brewfile" "$profiles_dir/$DEFAULT_PROFILE/Brewfile"
+    
+    local other_profile_name
+    other_profile_name=$(suggest_profile_name "$other_host_name")
+    mkdir -p "$profiles_dir/$other_profile_name"
+    [ -f "$other_host_dir/Brewfile" ] && cp "$other_host_dir/Brewfile" "$profiles_dir/$other_profile_name/Brewfile"
+    
+    # Create metadata
+    cat > "$profiles_dir/$DEFAULT_PROFILE/metadata.json" <<EOF
+{
+    "profile": "$DEFAULT_PROFILE",
+    "created_from_host": "$default_host_name",
+    "migration_date": "$(date -Iseconds)"
+}
+EOF
+    cat > "$profiles_dir/$other_profile_name/metadata.json" <<EOF
+{
+    "profile": "$other_profile_name",
+    "created_from_host": "$other_host_name",
+    "migration_date": "$(date -Iseconds)"
+}
+EOF
+    log_success "Created 'default' ($default_host_name) and '$other_profile_name' ($other_host_name) profiles"
+}
+
+# Function: Interactive migration for two hosts
+migrate_two_hosts() {
+    local backup_dir="$1"
+    local hosts_dir="$backup_dir/$HOSTS_DIR"
+    local profiles_dir="$backup_dir/$PROFILES_DIR"
+    
+    # Get host directories
+    local -a host_dirs=()
+    while IFS= read -r -d '' dir; do
+        host_dirs+=("$dir")
+    done < <(find "$hosts_dir" -maxdepth 1 -type d ! -path "$hosts_dir" -print0)
+    
+    if [ ${#host_dirs[@]} -ne 2 ]; then
+        log_error "Expected 2 hosts, found ${#host_dirs[@]}"
+        return 1
+    fi
+    
+    local host1_dir="${host_dirs[0]}"
+    local host2_dir="${host_dirs[1]}"
+    local host1_name host2_name
+    host1_name=$(basename "$host1_dir")
+    host2_name=$(basename "$host2_dir")
+    
+    # Get package counts and dates
+    local host1_stats host2_stats
+    host1_stats=$(get_host_stats "$host1_dir")
+    host2_stats=$(get_host_stats "$host2_dir")
+    
+    local host1_pkgs host1_date host2_pkgs host2_date
+    host1_pkgs=$(echo "$host1_stats" | cut -d'|' -f1)
+    host1_date=$(echo "$host1_stats" | cut -d'|' -f2)
+    host2_pkgs=$(echo "$host2_stats" | cut -d'|' -f1)
+    host2_date=$(echo "$host2_stats" | cut -d'|' -f2)
+    
+    display_two_host_migration_menu "$host1_name" "$host2_name" "$host1_pkgs" "$host2_pkgs" "$host1_date" "$host2_date"
+    
+    local choice
+    read -r choice
+    
+    case "$choice" in
+        1)
+            migrate_merge_hosts "$host1_dir" "$host2_dir" "$host1_name" "$host2_name" "$profiles_dir"
+            ;;
+        2a|2A)
+            migrate_separate_hosts "$host1_dir" "$host2_dir" "$host1_name" "$host2_name" "$profiles_dir"
+            ;;
+        2b|2B)
+            migrate_separate_hosts "$host2_dir" "$host1_dir" "$host2_name" "$host1_name" "$profiles_dir"
+            ;;
+        *)
+            log_error "Invalid choice. Migration cancelled."
+            return 1
+            ;;
+    esac
+    
+    return 0
+}
+
+# Helper: Display multiple hosts migration table
+display_multiple_hosts_table() {
+    local -a host_dirs=("$@")
+    local -a host_names=()
+    
+    # Extract host names from directories
+    for dir in "${host_dirs[@]}"; do
+        host_names+=("$(basename "$dir")")
+    done
+    
+    echo
+    log_info "Profile Migration Setup"
+    echo
+    echo "Found ${#host_dirs[@]} existing backups:"
+    printf "┌──────────────────┬──────────┬─────────────┐\n"
+    printf "│ %-16s │ %-8s │ %-11s │\n" "Host" "Packages" "Last Backup"
+    printf "├──────────────────┼──────────┼─────────────┤\n"
+    
+    for i in "${!host_dirs[@]}"; do
+        local host_dir="${host_dirs[$i]}"
+        local host_name="${host_names[$i]}"
+        local host_stats
+        host_stats=$(get_host_stats "$host_dir")
+        local pkg_count last_date
+        pkg_count=$(echo "$host_stats" | cut -d'|' -f1)
+        last_date=$(echo "$host_stats" | cut -d'|' -f2)
+        
+        printf "│ %-16s │ %-8s │ %-11s │\n" "$host_name" "$pkg_count pkgs" "$last_date"
+    done
+    printf "└──────────────────┴──────────┴─────────────┘\n"
+}
+
+# Helper: Collect profile names from user
+collect_profile_names() {
+    local -a host_names=("$@")
+    local -a profile_names=()
+    
+    echo
+    echo "Multiple machines detected. Let's organize them:"
+    echo
+    echo "Profile names (press Enter for suggested names):"
+    
+    for host_name in "${host_names[@]}"; do
+        local suggested_name
+        suggested_name=$(suggest_profile_name "$host_name")
+        echo -n "$host_name → [$suggested_name] "
+        read -r custom_name
+        if [ -n "$custom_name" ]; then
+            profile_names+=("$custom_name")
+        else
+            profile_names+=("$suggested_name")
+        fi
+    done
+    
+    echo
+    echo "Continue with these names? (Y/n): "
+    read -r confirm
+    
+    if [[ "$confirm" =~ ^[Nn] ]]; then
+        return 1
+    fi
+    
+    printf '%s\n' "${profile_names[@]}"
+}
+
+# Helper: Create profiles from multiple hosts
+create_multiple_profiles() {
+    local profiles_dir="$1"
+    shift
+    local -a host_dirs=("$@")
+    
+    # First half are host directories, second half are profile names
+    local host_count=$((${#host_dirs[@]} / 2))
+    local -a actual_host_dirs=("${host_dirs[@]:0:$host_count}")
+    local -a profile_names=("${host_dirs[@]:$host_count}")
+    
+    for i in "${!actual_host_dirs[@]}"; do
+        local host_dir="${actual_host_dirs[$i]}"
+        local host_name
+        host_name=$(basename "$host_dir")
+        local profile_name="${profile_names[$i]}"
+        local profile_dir="$profiles_dir/$profile_name"
+        
+        log_info "Creating '$profile_name' profile from $host_name..."
+        mkdir -p "$profile_dir"
+        
+        if [ -f "$host_dir/Brewfile" ]; then
+            cp "$host_dir/Brewfile" "$profile_dir/Brewfile"
+        fi
+        
+        cat > "$profile_dir/metadata.json" <<EOF
+{
+    "profile": "$profile_name",
+    "created_from_host": "$host_name",
+    "migration_date": "$(date -Iseconds)"
+}
+EOF
+    done
+    
+    log_success "Created ${#profile_names[@]} profiles: ${profile_names[*]}"
+}
+
+# Function: Interactive migration for multiple hosts (3+)
+migrate_multiple_hosts() {
+    local backup_dir="$1"
+    local hosts_dir="$backup_dir/$HOSTS_DIR"
+    local profiles_dir="$backup_dir/$PROFILES_DIR"
+    
+    # Get host directories
+    local -a host_dirs=()
+    local -a host_names=()
+    while IFS= read -r -d '' dir; do
+        host_dirs+=("$dir")
+        host_names+=("$(basename "$dir")")
+    done < <(find "$hosts_dir" -maxdepth 1 -type d ! -path "$hosts_dir" -print0)
+    
+    display_multiple_hosts_table "${host_dirs[@]}"
+    
+    # Collect profile names from user
+    local profile_names_output
+    profile_names_output=$(collect_profile_names "${host_names[@]}")
+    if [ $? -ne 0 ]; then
+        log_info "Migration cancelled."
+        return 1
+    fi
+    
+    # Convert output to array
+    local -a profile_names=()
+    while IFS= read -r line; do
+        profile_names+=("$line")
+    done <<< "$profile_names_output"
+    
+    # Create profiles (pass both arrays by combining them)
+    create_multiple_profiles "$profiles_dir" "${host_dirs[@]}" "${profile_names[@]}"
+    
+    return 0
+}
+
+# Function: Main migration orchestrator
+migrate_hosts_to_profiles() {
+    local backup_dir="$1"
+    local hosts_dir="$backup_dir/$HOSTS_DIR"
+    
+    if ! check_migration_needed "$backup_dir"; then
+        return 0
+    fi
+    
+    log_info "🔄 Migration from host-based to profile-based structure needed..."
+    
+    # Backup original data
+    if ! backup_original_data "$backup_dir"; then
+        log_error "Failed to backup original data. Migration aborted."
+        return 1
+    fi
+    
+    # Count hosts
+    local host_count
+    host_count=$(find "$hosts_dir" -maxdepth 1 -type d ! -path "$hosts_dir" | wc -l | tr -d ' ')
+    
+    case $host_count in
+        0)
+            log_warning "No host backups found."
+            ;;
+        1)
+            migrate_single_host "$backup_dir" || return 1
+            ;;
+        2)
+            migrate_two_hosts "$backup_dir" || return 1
+            ;;
+        *)
+            migrate_multiple_hosts "$backup_dir" || return 1
+            ;;
+    esac
+    
+    # Create migration completion flag
+    create_migration_flag "$backup_dir"
+    
+    log_success "✓ Migration completed successfully!"
+    echo
+    log_info "Your backup structure has been updated to use profiles."
+    log_info "Original data is preserved in $backup_dir/$MIGRATION_DIR/backup/"
+    
+    return 0
 }
 
 # Function: Detect all available storage locations
@@ -343,24 +885,39 @@ usage() {
     echo "  brew-sync backup [options]    # Backup current packages"
     echo "  brew-sync restore [options]   # Restore packages from backup"
     echo "  brew-sync list                # List available backups"
+    echo "  brew-sync profile [command]   # Manage profile aliases"
+    echo "  brew-sync cleanup [options]   # Clean up old backup files"
     echo "  brew-sync update              # Update to latest version"
     echo "  brew-sync uninstall           # Uninstall brew-sync"
     echo "  brew-sync help                # Show this help"
     echo ""
     echo "Backup examples:"
-    echo "  brew-sync backup                           # Auto-detect backup location"
+    echo "  brew-sync backup                           # Backup to default profile"
+    echo "  brew-sync backup --profile work            # Backup to work profile"
     echo "  brew-sync backup --git                     # Backup to Git repository"
-    echo "  brew-sync backup --dropbox -p dev          # Backup to Dropbox with dev profile"
+    echo "  brew-sync backup --dropbox --profile dev   # Backup to Dropbox with dev profile"
     echo ""
     echo "Restore examples:"
-    echo "  brew-sync restore                          # Restore from current Mac backup"
-    echo "  brew-sync restore --merged                 # Restore from merged backup of all Macs"
-    echo "  brew-sync restore --host MacBook-Pro       # Restore from specific Mac backup"
+    echo "  brew-sync restore                          # Restore from default profile"
+    echo "  brew-sync restore --profile work           # Restore from work profile"
     echo "  brew-sync restore --dry-run                # Preview only"
+    echo "  brew-sync restore --profile dev --dry-run  # Preview dev profile restore"
+    echo ""
+    echo "Profile examples:"
+    echo "  brew-sync list                             # List all profiles"
+    echo "  brew-sync backup --profile work            # Create work profile"
+    echo "  brew-sync restore --profile work           # Use work profile"
+    echo ""
+    echo "Cleanup examples:"
+    echo "  brew-sync cleanup                          # Remove duplicates and compress old backups"
+    echo "  brew-sync cleanup --dry-run                # Preview cleanup actions"
+    echo "  brew-sync cleanup --all                    # Full cleanup with archiving"
     echo ""
     echo "For detailed options, add --help to each command:"
     echo "  brew-sync backup --help"
     echo "  brew-sync restore --help"
+    echo "  brew-sync profile --help"
+    echo "  brew-sync cleanup --help"
     echo "  brew-sync update --help"
     echo ""
     echo "Note: Use --select-storage to change your default storage location."
@@ -427,10 +984,8 @@ restore_usage() {
     echo "Usage: brew-sync restore [options]"
     echo ""
     echo "What to restore:"
-    echo "  (default)            Current Mac's backup"
-    echo "  --merged             All Macs combined"
-    echo "  --host HOSTNAME      Specific Mac's backup"
-    echo "  -p, --profile NAME   Specific profile"
+    echo "  (default)            Default profile"
+    echo "  -p, --profile NAME   Specific profile (work, dev, etc.)"
     echo ""
     echo "Where to restore from:"
     echo "  (default)            Last used storage location"
@@ -443,10 +998,10 @@ restore_usage() {
     echo "  -l, --list           List available backups"
     echo ""
     echo "Examples:"
-    echo "  brew-sync restore --dry-run         # Preview your backup"
-    echo "  brew-sync restore                   # Restore your backup"
-    echo "  brew-sync restore --merged          # Restore from all Macs"
-    echo "  brew-sync restore --host MacBook    # Restore from MacBook"
+    echo "  brew-sync restore --dry-run         # Preview default profile"
+    echo "  brew-sync restore                   # Restore default profile"
+    echo "  brew-sync restore --profile work    # Restore work profile"
+    echo "  brew-sync restore -p dev --dry-run  # Preview dev profile"
     echo ""
     echo "Note: Only --select-storage changes your default. Other options are temporary."
     echo "For all options: brew-sync restore --help-all"
@@ -466,11 +1021,9 @@ restore_usage_full() {
     echo "  --select-storage       **Interactively choose storage location (saves as new default)**"
     echo "  --auto-detect          Auto-detect optimal backup location (default)"
     echo ""
-    echo "Restore type options (select one):"
-    echo "  --merged               Use merged Brewfile (packages from all Macs)"
-    echo "  --host HOSTNAME        Use specific Mac's Brewfile"
-    echo "  -p, --profile NAME     Use specific profile"
-    echo "  (default: current Mac's Brewfile)"
+    echo "Profile options:"
+    echo "  -p, --profile NAME     Use specific profile (work, dev, etc.)"
+    echo "  (default: default profile)"
     echo ""
     echo "Installation options:"
     echo "  -d, --dry-run          Preview only without actual installation"
@@ -484,10 +1037,10 @@ restore_usage_full() {
     echo "              Other source options are temporary for this restore only."
     echo ""
     echo "Examples:"
-    echo "  brew-sync restore                     # Auto-detect and restore current Mac backup"
-    echo "  brew-sync restore --git --merged      # Restore from Git repository merged packages"
-    echo "  brew-sync restore --dropbox --host MacBook-Pro  # Restore from specific Mac backup in Dropbox"
-    echo "  brew-sync restore --path ~/backup -p dev --merged  # Restore from custom path dev profile merged"
+    echo "  brew-sync restore                     # Auto-detect and restore default profile"
+    echo "  brew-sync restore --git --profile work   # Restore work profile from Git repository"
+    echo "  brew-sync restore --dropbox --profile dev # Restore dev profile from Dropbox"
+    echo "  brew-sync restore --path ~/backup --profile work  # Restore work profile from custom path"
 }
 
 # Function: Auto-detect backup location with smart selection
@@ -598,86 +1151,856 @@ handle_git_backup() {
     log_info "Backing up to Git repository: $git_root"
 }
 
-# Function: List available backups
-list_backups() {
-    log_info "Available backups:"
-    echo ""
+# Function: Analyze and create common packages
+analyze_common_packages() {
+    local hosts_dir="$1"
+    local common_dir="$BACKUP_DIR/common"
     
-    # Default profile hosts
-    if [ -d "$BACKUP_DIR/hosts" ]; then
-        echo "📱 Individual Mac backups:"
-        for host_dir in "$BACKUP_DIR/hosts"/*; do
+    # Skip if less than 2 hosts
+    local host_count=$(find "$hosts_dir" -maxdepth 1 -type d -name "*" | wc -l)
+    if [ "$host_count" -lt 3 ]; then  # 3 because find includes the parent dir
+        return 0
+    fi
+    
+    log_info "Analyzing common packages across $((host_count-1)) hosts..."
+    
+    # Create temporary files
+    local temp_all=$(mktemp)
+    local temp_common=$(mktemp)
+    
+    # Collect all packages from all hosts
+    find "$hosts_dir" -name "Brewfile" -exec cat {} \; | sort > "$temp_all"
+    
+    # Find packages that appear in 80% or more of hosts
+    local threshold=$(((host_count-1) * 80 / 100))
+    if [ "$threshold" -lt 2 ]; then
+        threshold=2
+    fi
+    
+    uniq -c "$temp_all" | awk -v th="$threshold" '$1 >= th {$1=""; print substr($0,2)}' > "$temp_common"
+    
+    if [ -s "$temp_common" ]; then
+        mkdir -p "$common_dir"
+        
+        # Create common Brewfile with header
+        {
+            echo "# Common packages across all Macs"
+            echo "# Auto-generated on $(date "+%Y-%m-%d %H:%M:%S")"
+            echo "# Threshold: $threshold/$((host_count-1)) hosts"
+            echo ""
+            cat "$temp_common"
+        } > "$common_dir/Brewfile"
+        
+        local common_count=$(wc -l < "$temp_common")
+        log_success "Created common Brewfile with $common_count packages"
+        
+        # Remove common packages from individual host files
+        for host_dir in "$hosts_dir"/*; do
             if [ -d "$host_dir" ] && [ -f "$host_dir/Brewfile" ]; then
-                hostname=$(basename "$host_dir")
-                if [ -f "$host_dir/backup_info.txt" ]; then
-                    last_backup=$(grep "Last backup:" "$host_dir/backup_info.txt" | cut -d: -f2- | xargs)
-                    package_count=$(grep "Total packages:" "$host_dir/backup_info.txt" | cut -d: -f2 | xargs)
-                    echo "  • $hostname (packages: $package_count, $last_backup)"
-                else
-                    echo "  • $hostname"
-                fi
+                local host_brewfile="$host_dir/Brewfile"
+                local temp_host=$(mktemp)
+                
+                # Keep only packages not in common
+                comm -23 <(sort "$host_brewfile") <(sort "$temp_common") > "$temp_host"
+                
+                # Add header to host-specific file
+                {
+                    echo "# Host-specific packages for $(basename "$host_dir")"
+                    echo "# Common packages are inherited from common/Brewfile"
+                    echo "# Last updated: $(date "+%Y-%m-%d %H:%M:%S")"
+                    echo ""
+                    cat "$temp_host"
+                } > "$host_brewfile"
+                
+                rm -f "$temp_host"
             fi
         done
-        echo ""
     fi
     
-    # Merged backup
-    if [ -d "$BACKUP_DIR/merged" ]; then
-        echo "🔄 Merged backups:"
-        if [ -f "$BACKUP_DIR/merged/Brewfile" ]; then
-            if [ -f "$BACKUP_DIR/merged/merge_info.txt" ]; then
-                last_merge=$(grep "Last merge:" "$BACKUP_DIR/merged/merge_info.txt" | cut -d: -f2- | xargs)
-                mac_count=$(grep "Included Mac count:" "$BACKUP_DIR/merged/merge_info.txt" | cut -d: -f2 | xargs)
-                package_count=$(grep "Total packages:" "$BACKUP_DIR/merged/merge_info.txt" | cut -d: -f2 | xargs)
-                echo "  • Default merged (Macs: ${mac_count}, packages: $package_count, $last_merge)"
-            else
-                echo "  • Default merged"
+    rm -f "$temp_all" "$temp_common"
+}
+
+# Function: Decompress backup file if needed
+decompress_backup_file() {
+    local source_file="$1"
+    local temp_dir="$2"
+    
+    # If file doesn't exist, try compressed version
+    if [ ! -f "$source_file" ] && [ -f "$source_file.gz" ]; then
+        log_info "Found compressed backup: $(basename "$source_file.gz")"
+        local temp_file="$temp_dir/$(basename "$source_file")"
+        gunzip -c "$source_file.gz" > "$temp_file"
+        echo "$temp_file"
+        return 0
+    elif [ -f "$source_file" ]; then
+        echo "$source_file"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function: Get latest backup file (compressed or uncompressed)
+get_latest_backup_file() {
+    local host_dir="$1"
+    local base_name="$2"  # e.g., "Brewfile"
+    
+    # Check if current file exists
+    if [ -f "$host_dir/$base_name" ]; then
+        echo "$host_dir/$base_name"
+        return 0
+    fi
+    
+    # Find latest timestamped backup (compressed or uncompressed)
+    local latest_file=""
+    local latest_timestamp=0
+    
+    # Check uncompressed files
+    for file in "$host_dir"/${base_name}_*; do
+        # Skip if glob didn't match any files
+        [ -f "$file" ] || continue
+        # Skip compressed files
+        [[ "$file" =~ \.gz$ ]] && continue
+        
+        local timestamp=$(basename "$file" | grep -o '[0-9]\{8\}_[0-9]\{6\}')
+        if [ -n "$timestamp" ]; then
+            local file_timestamp=$(echo "$timestamp" | tr -d '_')
+            if [ "$file_timestamp" -gt "$latest_timestamp" ]; then
+                latest_timestamp="$file_timestamp"
+                latest_file="$file"
             fi
         fi
-        echo ""
+    done
+    
+    # Check compressed files
+    for file in "$host_dir"/${base_name}_*.gz; do
+        # Skip if glob didn't match any files
+        [ -f "$file" ] || continue
+        
+        local timestamp=$(basename "$file" .gz | grep -o '[0-9]\{8\}_[0-9]\{6\}')
+        if [ -n "$timestamp" ]; then
+            local file_timestamp=$(echo "$timestamp" | tr -d '_')
+            if [ "$file_timestamp" -gt "$latest_timestamp" ]; then
+                latest_timestamp="$file_timestamp"
+                latest_file="$file"
+            fi
+        fi
+    done
+    
+    if [ -n "$latest_file" ]; then
+        echo "$latest_file"
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function: Combine common and host-specific packages
+combine_packages() {
+    local host_dir="$1"
+    local output_file="$2"
+    local common_file="$BACKUP_DIR/common/Brewfile"
+    local host_file="$host_dir/Brewfile"
+    local temp_dir=$(mktemp -d)
+    
+    # Handle compressed host file if needed
+    local actual_host_file="$host_file"
+    
+    # If main Brewfile doesn't exist, try compressed version
+    if [ ! -f "$host_file" ] && [ -f "$host_file.gz" ]; then
+        log_info "Found compressed backup: $(basename "$host_file.gz")"
+        actual_host_file="$temp_dir/$(basename "$host_file")"
+        gunzip -c "$host_file.gz" > "$actual_host_file"
+    elif [ ! -f "$host_file" ]; then
+        # Try to find latest backup file
+        local latest_compressed=$(ls -t "$host_dir"/Brewfile_*.gz 2>/dev/null | head -1)
+        if [ -n "$latest_compressed" ] && [ -f "$latest_compressed" ]; then
+            log_warning "Using latest compressed backup: $(basename "$latest_compressed")"
+            actual_host_file="$temp_dir/$(basename "$latest_compressed" .gz)"
+            gunzip -c "$latest_compressed" > "$actual_host_file"
+        else
+            # No backup files found
+            actual_host_file=""
+        fi
     fi
     
-    # Profile-specific backups
-    if [ -d "$BACKUP_DIR/profiles" ]; then
-        echo "📂 Profile backups:"
-        for profile_dir in "$BACKUP_DIR/profiles"/*; do
+    {
+        echo "# Combined Brewfile for $(basename "$host_dir")"
+        echo "# Generated on $(date "+%Y-%m-%d %H:%M:%S")"
+        echo ""
+        
+        if [ -f "$common_file" ]; then
+            echo "# === Common packages ==="
+            grep -v '^#' "$common_file" | grep -v '^$'
+            echo ""
+        fi
+        
+        if [ -n "$actual_host_file" ] && [ -f "$actual_host_file" ]; then
+            echo "# === Host-specific packages ==="
+            grep -v '^#' "$actual_host_file" | grep -v '^$'
+        fi
+    } > "$output_file"
+    
+    # Cleanup temporary decompressed file if created
+    if [[ "$actual_host_file" =~ ^"$temp_dir" ]]; then
+        rm -f "$actual_host_file"
+    fi
+    rm -rf "$temp_dir"
+}
+
+# Function: Profile management
+manage_profiles() {
+    local command="$1"
+    shift
+    
+    case "$command" in
+        list)
+            list_profiles
+            ;;
+        set)
+            set_profile "$@"
+            ;;
+        remove|rm)
+            remove_profile "$@"
+            ;;
+        show)
+            show_profile "$@"
+            ;;
+        help|--help|-h)
+            profile_usage
+            ;;
+        *)
+            log_error "Unknown profile command: $command"
+            profile_usage
+            exit 1
+            ;;
+    esac
+}
+
+# Function: List profiles
+list_profiles() {
+    # Auto-detect backup location for listing
+    detect_backup_location 2>/dev/null || BACKUP_DIR="$DEFAULT_BACKUP_DIR"
+    
+    local profiles_dir="$BACKUP_DIR/$PROFILES_DIR"
+    
+    echo "Available profiles:"
+    echo ""
+    
+    if [ -d "$profiles_dir" ]; then
+        local profile_count=0
+        echo "┌─────────────────────┬─────────────┬──────────────┐"
+        echo "│ Profile             │ Packages    │ Last Updated │"
+        echo "├─────────────────────┼─────────────┼──────────────┤"
+        
+        for profile_dir in "$profiles_dir"/*; do
             if [ -d "$profile_dir" ]; then
-                profile=$(basename "$profile_dir")
-                echo "  Profile: $profile"
+                local profile_name
+                profile_name=$(basename "$profile_dir")
+                local pkg_count=0
+                local last_date="never"
                 
-                # Individual Macs within profile
-                for host_dir in "$profile_dir"/*; do
-                    if [ -d "$host_dir" ] && [ -f "$host_dir/Brewfile" ]; then
-                        hostname=$(basename "$host_dir")
-                        if [ -f "$host_dir/backup_info.txt" ]; then
-                            package_count=$(grep "Total packages:" "$host_dir/backup_info.txt" | cut -d: -f2 | xargs)
-                            echo "    • $hostname (packages: $package_count)"
-                        else
-                            echo "    • $hostname"
-                        fi
+                if [ -f "$profile_dir/Brewfile" ]; then
+                    pkg_count=$(grep -c "^brew\|^cask\|^mas" "$profile_dir/Brewfile" 2>/dev/null || echo "0")
+                    last_date=$(stat -f %Sm -t "%Y-%m-%d" "$profile_dir/Brewfile" 2>/dev/null || echo "never")
+                fi
+                
+                printf "│ %-19s │ %-11s │ %-12s │\n" "$profile_name" "$pkg_count pkgs" "$last_date"
+                ((profile_count++))
+            fi
+        done
+        
+        echo "└─────────────────────┴─────────────┴──────────────┘"
+        echo ""
+        echo "Found $profile_count profile(s)"
+    else
+        echo "  No profiles found."
+        echo ""
+        echo "  To create a profile, run:"
+        echo "    brew-sync backup --profile PROFILE_NAME"
+    fi
+}
+
+# Function: Set profile (legacy compatibility message)
+set_profile() {
+    log_error "Profile aliases are no longer supported."
+    echo ""
+    echo "The new profile system uses actual directories instead of aliases."
+    echo "To work with profiles:"
+    echo "  • backup:  brew-sync backup --profile PROFILE_NAME"
+    echo "  • restore: brew-sync restore --profile PROFILE_NAME"
+    echo "  • list:    brew-sync list"
+    echo "  • show:    brew-sync profile show PROFILE_NAME"
+    exit 1
+}
+
+# Function: Remove profile
+remove_profile() {
+    local profile_name="$1"
+    
+    if [ -z "$profile_name" ]; then
+        log_error "Usage: brew-sync profile remove PROFILE_NAME"
+        exit 1
+    fi
+    
+    if [ "$profile_name" = "$DEFAULT_PROFILE" ]; then
+        log_error "Cannot remove the default profile"
+        exit 1
+    fi
+    
+    # Auto-detect backup location
+    detect_backup_location 2>/dev/null || BACKUP_DIR="$DEFAULT_BACKUP_DIR"
+    
+    local profile_dir="$BACKUP_DIR/$PROFILES_DIR/$profile_name"
+    
+    if [ -d "$profile_dir" ]; then
+        echo "This will permanently delete profile '$profile_name' and all its backups."
+        echo -n "Are you sure? (y/N): "
+        read -r response
+        
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            rm -rf "$profile_dir"
+            log_success "Profile '$profile_name' removed"
+        else
+            log_info "Profile removal cancelled"
+        fi
+    else
+        log_error "Profile '$profile_name' not found"
+        echo ""
+        echo "Available profiles:"
+        get_available_profiles
+        exit 1
+    fi
+}
+
+# Function: Show profile
+show_profile() {
+    local profile_name="$1"
+    
+    if [ -z "$profile_name" ]; then
+        log_error "Usage: brew-sync profile show PROFILE_NAME"
+        exit 1
+    fi
+    
+    if ! validate_profile_name "$profile_name"; then
+        log_error "Invalid profile name: $profile_name"
+        exit 1
+    fi
+    
+    # Auto-detect backup location
+    detect_backup_location 2>/dev/null || BACKUP_DIR="$DEFAULT_BACKUP_DIR"
+    
+    local profile_dir="$BACKUP_DIR/$PROFILES_DIR/$profile_name"
+    
+    if [ -d "$profile_dir" ]; then
+        echo "Profile: $profile_name"
+        echo "Path: $profile_dir"
+        echo ""
+        
+        # Show metadata if available
+        if [ -f "$profile_dir/metadata.json" ]; then
+            echo "Metadata:"
+            if command -v jq >/dev/null 2>&1; then
+                jq . "$profile_dir/metadata.json" 2>/dev/null | sed 's/^/  /' || {
+                    echo "  (Metadata file exists but couldn't parse with jq)"
+                    cat "$profile_dir/metadata.json" | sed 's/^/  /'
+                }
+            else
+                cat "$profile_dir/metadata.json" | sed 's/^/  /'
+            fi
+            echo ""
+        fi
+        
+        # Show package statistics
+        if [ -f "$profile_dir/Brewfile" ]; then
+            local brew_count cask_count mas_count total_count
+            brew_count=$(grep -c "^brew " "$profile_dir/Brewfile" 2>/dev/null || echo "0")
+            cask_count=$(grep -c "^cask " "$profile_dir/Brewfile" 2>/dev/null || echo "0")
+            mas_count=$(grep -c "^mas " "$profile_dir/Brewfile" 2>/dev/null || echo "0")
+            total_count=$((brew_count + cask_count + mas_count))
+            
+            local last_updated
+            last_updated=$(stat -f %Sm -t "%Y-%m-%d %H:%M" "$profile_dir/Brewfile" 2>/dev/null || echo "unknown")
+            
+            echo "Package statistics:"
+            echo "  Homebrew packages: $brew_count"
+            echo "  Cask applications: $cask_count"
+            echo "  Mac App Store apps: $mas_count"
+            echo "  Total packages: $total_count"
+            echo "  Last updated: $last_updated"
+        else
+            echo "No Brewfile found in this profile"
+        fi
+    else
+        log_error "Profile '$profile_name' not found"
+        echo ""
+        echo "Available profiles:"
+        get_available_profiles
+        exit 1
+    fi
+}
+
+# Function: Profile usage
+profile_usage() {
+    echo "Usage: brew-sync profile [command] [options]"
+    echo ""
+    echo "Commands:"
+    echo "  list                    List all profiles"
+    echo "  show PROFILE            Show profile details and statistics"
+    echo "  remove PROFILE          Remove profile (except 'default')"
+    echo ""
+    echo "Examples:"
+    echo "  brew-sync profile list"
+    echo "  brew-sync profile show work"
+    echo "  brew-sync profile remove old-profile"
+    echo ""
+    echo "To create/use profiles:"
+    echo "  brew-sync backup --profile work          # Create/update work profile"
+    echo "  brew-sync restore --profile work         # Restore from work profile"
+    echo "  brew-sync list                           # List all backups by profile"
+    echo ""
+    echo "Note: Profiles are directories that store independent backup sets."
+    echo "      Each profile maintains its own Brewfile and metadata."
+}
+
+# Function: Calculate file hash for deduplication
+calculate_file_hash() {
+    local file="$1"
+    if [ -f "$file" ]; then
+        shasum -a 256 "$file" | cut -d' ' -f1
+    fi
+}
+
+# Function: Create deduplication storage
+create_dedup_storage() {
+    local backup_dir="$1"
+    local dedup_dir="$backup_dir/.dedup"
+    
+    mkdir -p "$dedup_dir/objects"
+    mkdir -p "$dedup_dir/refs"
+    
+    echo "$dedup_dir"
+}
+
+# Function: Store file with deduplication
+store_deduplicated_file() {
+    local source_file="$1"
+    local target_path="$2"
+    local backup_dir="$3"
+    
+    local dedup_dir=$(create_dedup_storage "$backup_dir")
+    local file_hash=$(calculate_file_hash "$source_file")
+    local object_file="$dedup_dir/objects/$file_hash"
+    
+    # Store original file if not exists
+    if [ ! -f "$object_file" ]; then
+        cp "$source_file" "$object_file"
+        log_info "Stored deduplicated object: ${file_hash:0:8}..."
+    fi
+    
+    # Create reference (symlink or copy)
+    local ref_file="$dedup_dir/refs/$(basename "$target_path")_$(date +%Y%m%d_%H%M%S)"
+    echo "$file_hash|$target_path|$(date +%s)" > "$ref_file"
+    
+    # Create timestamped backup using symlink to save space
+    if [ -L "$target_path" ]; then
+        rm "$target_path"
+    elif [ -f "$target_path" ]; then
+        local backup_name="${target_path}_$(date +%Y%m%d_%H%M%S)"
+        if [ ! -f "$backup_name" ]; then
+            # Check if we already have this content
+            local existing_hash=$(calculate_file_hash "$target_path")
+            local existing_object="$dedup_dir/objects/$existing_hash"
+            if [ -f "$existing_object" ]; then
+                ln -s "$(realpath --relative-to="$(dirname "$backup_name")" "$existing_object")" "$backup_name"
+            else
+                mv "$target_path" "$backup_name"
+            fi
+        fi
+    fi
+    
+    # Create symlink to deduplicated object
+    ln -s "$(realpath --relative-to="$(dirname "$target_path")" "$object_file")" "$target_path"
+}
+
+# Function: Compress old backup files
+compress_old_backups() {
+    local backup_dir="$1"
+    local compress_after_days="${2:-30}"
+    local archive_after_days="${3:-365}"
+    
+    log_info "Compressing backups older than $compress_after_days days..."
+    
+    # Find files older than compress_after_days for gzip compression
+    if [ "$compress_after_days" -eq 0 ]; then
+        # Special case: compress all files immediately
+        find "$backup_dir" -name "Brewfile_*" -type f ! -name "*.gz" ! -name "*.tar.gz" | while read -r file; do
+            if [ -f "$file" ]; then
+                gzip "$file"
+                log_info "Compressed: $(basename "$file")"
+            fi
+        done
+    else
+        # Normal case: compress files older than specified days
+        find "$backup_dir" -name "Brewfile_*" -type f -mtime +$compress_after_days ! -name "*.gz" ! -name "*.tar.gz" | while read -r file; do
+            if [ -f "$file" ]; then
+                gzip "$file"
+                log_info "Compressed: $(basename "$file")"
+            fi
+        done
+    fi
+    
+    # Find files older than archive_after_days for tar.gz archiving
+    if [ "$archive_after_days" -gt "$compress_after_days" ]; then
+        local archive_dir="$backup_dir/.archive"
+        mkdir -p "$archive_dir"
+        
+        local cutoff_date=$(date -j -v-${archive_after_days}d +%Y%m%d)
+        
+        find "$backup_dir" -name "Brewfile_*.gz" -type f | while read -r file; do
+            local file_date=$(basename "$file" | grep -o '[0-9]\{8\}' | head -1)
+            if [ -n "$file_date" ] && [ "$file_date" -lt "$cutoff_date" ]; then
+                local year=${file_date:0:4}
+                local archive_file="$archive_dir/backups_$year.tar.gz"
+                
+                # Add to yearly archive
+                tar -czf "$archive_file.tmp" -C "$(dirname "$file")" "$(basename "$file")" 2>/dev/null || {
+                    # If archive doesn't exist, create new one
+                    tar -czf "$archive_file.tmp" -C "$(dirname "$file")" "$(basename "$file")"
+                }
+                
+                # If archive already exists, append to it
+                if [ -f "$archive_file" ]; then
+                    tar -czf "$archive_file.new" --concatenate "$archive_file" "$archive_file.tmp"
+                    mv "$archive_file.new" "$archive_file"
+                    rm "$archive_file.tmp"
+                else
+                    mv "$archive_file.tmp" "$archive_file"
+                fi
+                
+                rm "$file"
+                log_info "Archived: $(basename "$file") -> backups_$year.tar.gz"
+            fi
+        done
+    fi
+}
+
+# Function: Remove duplicate backup files
+remove_duplicate_backups() {
+    local directory="$1"
+    local temp_hashes=$(mktemp)
+    local temp_duplicates=$(mktemp)
+    
+    log_info "Scanning for duplicate backups in $(basename "$directory")..."
+    
+    # Calculate hashes for all backup files (both old and new formats)
+    find "$directory" \( -name "Brewfile_*" -o -name "Brewfile" \) -type f ! -name "*.gz" | while read -r file; do
+        local hash=$(calculate_file_hash "$file")
+        echo "$hash|$file" >> "$temp_hashes"
+    done
+    
+    # Find duplicates (same hash, different files)
+    sort "$temp_hashes" | awk -F'|' '
+    {
+        if (seen[$1]) {
+            print $2 " (duplicate of " seen[$1] ")"
+        } else {
+            seen[$1] = $2
+        }
+    }' > "$temp_duplicates"
+    
+    local duplicate_count=0
+    while IFS= read -r line; do
+        if [ -n "$line" ]; then
+            local file_to_remove=$(echo "$line" | cut -d' ' -f1)
+            if [ -f "$file_to_remove" ]; then
+                rm "$file_to_remove"
+                log_info "Removed duplicate: $(basename "$file_to_remove")"
+                ((duplicate_count++))
+            fi
+        fi
+    done < "$temp_duplicates"
+    
+    if [ "$duplicate_count" -gt 0 ]; then
+        log_success "Removed $duplicate_count duplicate backup files"
+    else
+        log_info "No duplicate backup files found"
+    fi
+    
+    rm -f "$temp_hashes" "$temp_duplicates"
+}
+
+# Function: Cleanup usage
+cleanup_usage() {
+    echo "Usage: brew-sync cleanup [options]"
+    echo ""
+    echo "Options:"
+    echo "  --compress-after DAYS    Compress backups older than N days (default: 30)"
+    echo "  --archive-after DAYS     Archive backups older than N days (default: 365)"
+    echo "  --remove-duplicates      Remove duplicate backup files"
+    echo "  --dry-run               Show what would be cleaned up without doing it"
+    echo "  --all                   Perform all cleanup operations"
+    echo "  -h, --help              Show this help"
+    echo ""
+    echo "Examples:"
+    echo "  brew-sync cleanup                              # Default cleanup (compress + dedup)"
+    echo "  brew-sync cleanup --compress-after 14         # Compress after 14 days"
+    echo "  brew-sync cleanup --remove-duplicates         # Only remove duplicates"
+    echo "  brew-sync cleanup --dry-run                   # Preview cleanup actions"
+    echo "  brew-sync cleanup --all                       # Full cleanup with archiving"
+    echo ""
+    echo "Storage optimization:"
+    echo "  • Duplicate detection uses SHA256 hashes"
+    echo "  • Compression uses gzip (typically 80-90% reduction)"
+    echo "  • Archiving groups old backups by year"
+}
+
+# Function: Cleanup implementation
+do_cleanup() {
+    local COMPRESS_AFTER=30
+    local ARCHIVE_AFTER=365
+    local REMOVE_DUPLICATES=true
+    local DRY_RUN=false
+    local DO_COMPRESSION=true
+    local DO_ARCHIVING=false
+    
+    # Parse cleanup arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --compress-after)
+                COMPRESS_AFTER="$2"
+                shift 2
+                ;;
+            --archive-after)
+                ARCHIVE_AFTER="$2"
+                DO_ARCHIVING=true
+                shift 2
+                ;;
+            --remove-duplicates)
+                REMOVE_DUPLICATES=true
+                DO_COMPRESSION=false
+                shift
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                shift
+                ;;
+            --all)
+                REMOVE_DUPLICATES=true
+                DO_COMPRESSION=true
+                DO_ARCHIVING=true
+                shift
+                ;;
+            -h|--help)
+                cleanup_usage
+                exit 0
+                ;;
+            *)
+                log_error "Unknown cleanup option: $1"
+                cleanup_usage
+                exit 1
+                ;;
+        esac
+    done
+    
+    # Auto-detect backup location
+    detect_backup_location 2>/dev/null || BACKUP_DIR="$DEFAULT_BACKUP_DIR"
+    
+    if [ ! -d "$BACKUP_DIR" ]; then
+        log_error "Backup directory not found: $BACKUP_DIR"
+        exit 1
+    fi
+    
+    log_info "Starting cleanup of backup directory: $BACKUP_DIR"
+    
+    if [ "$DRY_RUN" = true ]; then
+        log_warning "DRY RUN mode - no files will be modified"
+    fi
+    
+    # Calculate current storage usage
+    local initial_size=$(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1)
+    log_info "Current backup size: $initial_size"
+    
+    # 1. Remove duplicate backups from all profiles
+    if [ "$REMOVE_DUPLICATES" = true ]; then
+        if [ "$DRY_RUN" = false ]; then
+            local profiles_dir="$BACKUP_DIR/$PROFILES_DIR"
+            if [ -d "$profiles_dir" ]; then
+                for profile_dir in "$profiles_dir"/*; do
+                    if [ -d "$profile_dir" ]; then
+                        remove_duplicate_backups "$profile_dir"
                     fi
                 done
-                
-                # Profile merged backup
-                if [ -f "$BACKUP_DIR/merged/Brewfile_$profile" ]; then
-                    if [ -f "$BACKUP_DIR/merged/merge_info_$profile.txt" ]; then
-                        mac_count=$(grep "Included Mac count:" "$BACKUP_DIR/merged/merge_info_$profile.txt" | cut -d: -f2 | xargs)
-                        package_count=$(grep "Total packages:" "$BACKUP_DIR/merged/merge_info_$profile.txt" | cut -d: -f2 | xargs)
-                        echo "    🔄 Merged version (Macs: ${mac_count}, packages: $package_count)"
+            fi
+            
+            # Also clean up old hosts directory if it exists
+            if [ -d "$BACKUP_DIR/hosts" ]; then
+                remove_duplicate_backups "$BACKUP_DIR/hosts"
+            fi
+            if [ -d "$BACKUP_DIR/merged" ]; then
+                remove_duplicate_backups "$BACKUP_DIR/merged"
+            fi
+        else
+            log_info "[DRY-RUN] Would scan for and remove duplicate backup files across all profiles"
+        fi
+    fi
+    
+    # 2. Compress old backups
+    if [ "$DO_COMPRESSION" = true ]; then
+        if [ "$DRY_RUN" = false ]; then
+            compress_old_backups "$BACKUP_DIR" "$COMPRESS_AFTER" "$ARCHIVE_AFTER"
+        else
+            log_info "[DRY-RUN] Would compress backups older than $COMPRESS_AFTER days"
+            if [ "$DO_ARCHIVING" = true ]; then
+                log_info "[DRY-RUN] Would archive backups older than $ARCHIVE_AFTER days"
+            fi
+        fi
+    fi
+    
+    # 3. Clean up empty directories
+    if [ "$DRY_RUN" = false ]; then
+        find "$BACKUP_DIR" -type d -empty -delete 2>/dev/null || true
+    else
+        local empty_dirs=$(find "$BACKUP_DIR" -type d -empty 2>/dev/null | wc -l)
+        if [ "$empty_dirs" -gt 0 ]; then
+            log_info "[DRY-RUN] Would remove $empty_dirs empty directories"
+        fi
+    fi
+    
+    # Show final results
+    if [ "$DRY_RUN" = false ]; then
+        local final_size=$(du -sh "$BACKUP_DIR" 2>/dev/null | cut -f1)
+        log_success "Cleanup completed!"
+        log_info "Storage before: $initial_size"
+        log_info "Storage after:  $final_size"
+        
+        # Calculate savings if possible
+        if command -v numfmt >/dev/null 2>&1; then
+            local initial_bytes=$(du -sb "$BACKUP_DIR" 2>/dev/null | cut -f1)
+            local savings_percent=$(( (initial_bytes > 0) ? (100 - ($(du -sb "$BACKUP_DIR" 2>/dev/null | cut -f1) * 100 / initial_bytes)) : 0 ))
+            if [ "$savings_percent" -gt 0 ]; then
+                log_info "Space saved: ~$savings_percent%"
+            fi
+        fi
+    else
+        log_info "[DRY-RUN] Use without --dry-run to perform actual cleanup"
+    fi
+}
+
+# Function: Resolve profile to host
+resolve_profile() {
+    local profile_name="$1"
+    local profiles_dir="$BACKUP_DIR/profiles"
+    local profile_link="$profiles_dir/$profile_name"
+    
+    if [ -L "$profile_link" ]; then
+        local target=$(readlink "$profile_link")
+        echo "$(basename "$target")"
+        return 0
+    else
+        # Return the original name if no profile alias exists
+        echo "$profile_name"
+        return 1
+    fi
+}
+
+# Function: List available backups
+list_backups() {
+    # Check for migration first
+    if check_migration_needed "$BACKUP_DIR"; then
+        log_warning "Migration needed. Run 'brew-sync backup' or 'brew-sync restore' to trigger automatic migration."
+        echo ""
+        
+        # Show legacy host-based backups
+        if [ -d "$BACKUP_DIR/hosts" ]; then
+            echo "📱 Legacy host-based backups (need migration):"
+            for host_dir in "$BACKUP_DIR/hosts"/*; do
+                if [ -d "$host_dir" ] && [ -f "$host_dir/Brewfile" ]; then
+                    local hostname=$(basename "$host_dir")
+                    if [ -f "$host_dir/backup_info.txt" ]; then
+                        local last_backup=$(grep "Last backup:" "$host_dir/backup_info.txt" | cut -d: -f2- | xargs)
+                        local package_count=$(grep "Total packages:" "$host_dir/backup_info.txt" | cut -d: -f2 | xargs)
+                        echo "  • $hostname (packages: $package_count, $last_backup)"
                     else
-                        echo "    🔄 Merged version"
+                        echo "  • $hostname"
                     fi
                 fi
+            done
+        fi
+        return 0
+    fi
+
+    log_info "Available profiles:"
+    echo ""
+    
+    # Profile-based backups
+    if [ -d "$BACKUP_DIR/$PROFILES_DIR" ]; then
+        local found_profiles=false
+        for profile_dir in "$BACKUP_DIR/$PROFILES_DIR"/*; do
+            if [ -d "$profile_dir" ] && [ -f "$profile_dir/Brewfile" ]; then
+                local profile=$(basename "$profile_dir")
+                found_profiles=true
+                
+                # Basic profile info
+                local pkg_count
+                pkg_count=$(grep -c '^[^#]' "$profile_dir/Brewfile" 2>/dev/null || echo "0")
+                
+                # Check for metadata.json
+                if [ -f "$profile_dir/metadata.json" ]; then
+                    if command -v jq >/dev/null 2>&1; then
+                        local last_backup
+                        local hostname
+                        local brew_count
+                        local cask_count
+                        local mas_count
+                        
+                        last_backup=$(jq -r '.last_backup // "unknown"' "$profile_dir/metadata.json" 2>/dev/null)
+                        hostname=$(jq -r '.hostname // "unknown"' "$profile_dir/metadata.json" 2>/dev/null)
+                        brew_count=$(jq -r '.package_count.brew // 0' "$profile_dir/metadata.json" 2>/dev/null)
+                        cask_count=$(jq -r '.package_count.cask // 0' "$profile_dir/metadata.json" 2>/dev/null)
+                        mas_count=$(jq -r '.package_count.mas // 0' "$profile_dir/metadata.json" 2>/dev/null)
+                        
+                        echo "📂 $profile"
+                        echo "   Last backup: $last_backup"
+                        echo "   From host: $hostname"
+                        echo "   Packages: brew($brew_count) cask($cask_count) mas($mas_count)"
+                    else
+                        echo "📂 $profile (packages: $pkg_count)"
+                    fi
+                # Fallback to backup_info.txt
+                elif [ -f "$profile_dir/backup_info.txt" ]; then
+                    local last_backup=$(grep "Last backup:" "$profile_dir/backup_info.txt" | cut -d: -f2- | xargs)
+                    local hostname=$(grep "Hostname:" "$profile_dir/backup_info.txt" | cut -d: -f2- | xargs)
+                    echo "📂 $profile"
+                    echo "   Last backup: $last_backup"
+                    echo "   From host: $hostname"
+                    echo "   Packages: $pkg_count"
+                else
+                    echo "📂 $profile (packages: $pkg_count)"
+                fi
+                
+                # Show backup files count
+                local backup_files
+                backup_files=$(find "$profile_dir" -name "Brewfile_*" -type f | wc -l | tr -d ' ')
+                if [ "$backup_files" -gt 0 ]; then
+                    echo "   Backup files: $backup_files"
+                fi
+                
                 echo ""
             fi
         done
+        
+        if [ "$found_profiles" = false ]; then
+            echo "No profiles found. Run 'brew-sync backup' to create your first profile."
+        fi
+    else
+        echo "No profiles found. Run 'brew-sync backup' to create your first profile."
     fi
 }
 
 # Function: Backup implementation
 do_backup() {
     # Default options
-    local MERGE_MODE=true
     local PROFILE=""
     local CUSTOM_PATH=""
     local USE_GIT=false
@@ -690,10 +2013,6 @@ do_backup() {
             -p|--profile)
                 PROFILE="$2"
                 shift 2
-                ;;
-            --no-merge)
-                MERGE_MODE=false
-                shift
                 ;;
             --select-storage)
                 INTERACTIVE_STORAGE=true
@@ -785,16 +2104,31 @@ do_backup() {
         BACKUP_METHOD="icloud"
     fi
 
-    # Set directory paths
-    if [ -n "$PROFILE" ]; then
-        HOST_DIR="$BACKUP_DIR/profiles/$PROFILE/$HOSTNAME"
-        PROFILE_SUFFIX="_$PROFILE"
-    else
-        HOST_DIR="$BACKUP_DIR/hosts/$HOSTNAME"
-        PROFILE_SUFFIX=""
+    # Check for migration before proceeding
+    if check_migration_needed "$BACKUP_DIR"; then
+        migrate_hosts_to_profiles "$BACKUP_DIR" || {
+            log_error "Migration failed. Backup aborted."
+            exit 1
+        }
     fi
 
-    MERGED_DIR="$BACKUP_DIR/merged"
+    # Set profile (default to 'default' if not specified)
+    if [ -z "$PROFILE" ]; then
+        PROFILE="$DEFAULT_PROFILE"
+    fi
+
+    # Validate profile name
+    if ! validate_profile_name "$PROFILE"; then
+        log_error "Invalid profile name: '$PROFILE'"
+        log_info "Profile names must be alphanumeric with hyphens/underscores only (max 50 chars)"
+        log_info "Reserved names: hosts, merged, common, .migration"
+        exit 1
+    fi
+
+    # Set directory paths - use profiles/ structure
+    PROFILE_DIR=$(get_profile_path "$BACKUP_DIR" "$PROFILE")
+    
+    log_info "Using profile: $PROFILE"
 
     # Check Homebrew installation
     if ! command -v brew &> /dev/null; then
@@ -815,15 +2149,10 @@ do_backup() {
     fi
 
     # Create backup directories
-    mkdir -p "$HOST_DIR"
-    if [ "$MERGE_MODE" = true ]; then
-        mkdir -p "$MERGED_DIR"
-    fi
+    mkdir -p "$PROFILE_DIR"
 
     log_info "Starting Brewfile backup..."
-    if [ -n "$PROFILE" ]; then
-        log_info "Profile: $PROFILE"
-    fi
+    log_info "Profile: $PROFILE"
     log_info "Host: $HOSTNAME"
 
     # Generate Brewfile in temporary directory
@@ -840,21 +2169,21 @@ do_backup() {
         exit 1
     fi
 
-    # Host-specific backup
+    # Profile-specific backup
     CURRENT_BREWFILE="$TEMP_DIR/$BREWFILE_NAME"
-    HOST_BREWFILE="$HOST_DIR/$BREWFILE_NAME"
+    PROFILE_BREWFILE="$PROFILE_DIR/$BREWFILE_NAME"
 
     # Compare with existing file
     local CHANGES_DETECTED=false
-    if [ -f "$HOST_BREWFILE" ]; then
-        if cmp -s "$CURRENT_BREWFILE" "$HOST_BREWFILE"; then
+    if [ -f "$PROFILE_BREWFILE" ]; then
+        if cmp -s "$CURRENT_BREWFILE" "$PROFILE_BREWFILE"; then
             log_info "[$HOSTNAME] No changes detected."
             CHANGES_DETECTED=false
         else
             log_info "[$HOSTNAME] Changes detected."
             # Backup existing file with timestamp
-            BACKUP_FILE="$HOST_DIR/Brewfile_$TIMESTAMP"
-            cp "$HOST_BREWFILE" "$BACKUP_FILE"
+            BACKUP_FILE="$PROFILE_DIR/Brewfile_$TIMESTAMP"
+            cp "$PROFILE_BREWFILE" "$BACKUP_FILE"
             log_info "[$HOSTNAME] Backed up existing Brewfile: Brewfile_$TIMESTAMP"
             CHANGES_DETECTED=true
         fi
@@ -864,142 +2193,61 @@ do_backup() {
     fi
 
     # Copy new Brewfile to host directory
-    cp "$CURRENT_BREWFILE" "$HOST_BREWFILE"
+    cp "$CURRENT_BREWFILE" "$PROFILE_BREWFILE"
 
-    # Create host-specific backup info file
-    cat > "$HOST_DIR/backup_info.txt" << EOF
+    # Create profile-specific backup info file
+    cat > "$PROFILE_DIR/backup_info.txt" << EOF
 Hostname: $HOSTNAME
-Last backup: $(date)
+Last backup: $(date "+%Y-%m-%d %H:%M:%S")
 User: $(whoami)
 macOS version: $(sw_vers -productVersion)
 Homebrew version: $(brew --version | head -n1)
 Profile: ${PROFILE:-"default"}
-Total packages: $(grep -E '^(brew|cask|mas)' "$HOST_BREWFILE" | wc -l | tr -d ' ')
+Total packages: $(grep -E '^(brew|cask|mas)' "$PROFILE_BREWFILE" | wc -l | tr -d ' ')
 EOF
 
     # Package statistics
-    BREW_COUNT=$(grep '^brew ' "$HOST_BREWFILE" | wc -l | tr -d ' ')
-    CASK_COUNT=$(grep '^cask ' "$HOST_BREWFILE" | wc -l | tr -d ' ')
-    MAS_COUNT=$(grep '^mas ' "$HOST_BREWFILE" | wc -l | tr -d ' ')
+    BREW_COUNT=$(grep '^brew ' "$PROFILE_BREWFILE" | wc -l | tr -d ' ')
+    CASK_COUNT=$(grep '^cask ' "$PROFILE_BREWFILE" | wc -l | tr -d ' ')
+    MAS_COUNT=$(grep '^mas ' "$PROFILE_BREWFILE" | wc -l | tr -d ' ')
 
     log_success "[$HOSTNAME] Backup completed!"
-    log_info "Backup location: $HOST_BREWFILE"
+    log_info "Backup location: $PROFILE_BREWFILE"
     log_info "Package statistics: Homebrew($BREW_COUNT) Cask($CASK_COUNT) MAS($MAS_COUNT)"
     
+    # Create metadata.json for the profile
+    cat > "$PROFILE_DIR/metadata.json" <<EOF
+{
+    "profile": "$PROFILE",
+    "hostname": "$HOSTNAME",
+    "last_backup": "$(date -Iseconds)",
+    "user": "$(whoami)",
+    "macos_version": "$(sw_vers -productVersion)",
+    "homebrew_version": "$(brew --version | head -n1)",
+    "package_count": {
+        "brew": $BREW_COUNT,
+        "cask": $CASK_COUNT,
+        "mas": $MAS_COUNT
+    }
+}
+EOF
+
     # Save the successful backup storage choice for future use
     save_last_storage "$BACKUP_METHOD" "$BACKUP_DIR"
-
-    # Perform merge operation
-    if [ "$MERGE_MODE" = true ] && [ "$CHANGES_DETECTED" = true ]; then
-        log_merge "Starting multi-Mac environment merge..."
-        
-        # Collect Brewfiles from all hosts
-        ALL_BREWFILES=()
-        if [ -n "$PROFILE" ]; then
-            SEARCH_DIR="$BACKUP_DIR/profiles/$PROFILE"
-        else
-            SEARCH_DIR="$BACKUP_DIR/hosts"
-        fi
-        
-        if [ -d "$SEARCH_DIR" ]; then
-            while IFS= read -r -d '' brewfile; do
-                ALL_BREWFILES+=("$brewfile")
-            done < <(find "$SEARCH_DIR" -name "Brewfile" -type f -print0)
-        fi
-        
-        if [ ${#ALL_BREWFILES[@]} -gt 1 ]; then
-            log_merge "Found Macs: ${#ALL_BREWFILES[@]}"
-            
-            # Generate merged Brewfile
-            MERGED_BREWFILE="$MERGED_DIR/Brewfile$PROFILE_SUFFIX"
-            TEMP_MERGED="$TEMP_DIR/merged_brewfile"
-            
-            # Collect and sort tap statements
-            {
-                echo "# Merged Brewfile - $(date)"
-                echo "# Included Macs: $(find "$SEARCH_DIR" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | tr '\n' ' ')"
-                echo ""
-                
-                # Collect taps
-                for brewfile in "${ALL_BREWFILES[@]}"; do
-                    grep '^tap ' "$brewfile" 2>/dev/null || true
-                done | sort -u
-                
-                echo ""
-                
-                # Collect brews
-                for brewfile in "${ALL_BREWFILES[@]}"; do
-                    grep '^brew ' "$brewfile" 2>/dev/null || true
-                done | sort -u
-                
-                echo ""
-                
-                # Collect casks
-                for brewfile in "${ALL_BREWFILES[@]}"; do
-                    grep '^cask ' "$brewfile" 2>/dev/null || true
-                done | sort -u
-                
-                echo ""
-                
-                # Collect mas
-                for brewfile in "${ALL_BREWFILES[@]}"; do
-                    grep '^mas ' "$brewfile" 2>/dev/null || true
-                done | sort -u
-                
-            } > "$TEMP_MERGED"
-            
-            # Compare with existing merge file
-            if [ -f "$MERGED_BREWFILE" ] && cmp -s "$TEMP_MERGED" "$MERGED_BREWFILE"; then
-                log_merge "No changes in merged file."
-            else
-                # Backup existing merge file
-                if [ -f "$MERGED_BREWFILE" ]; then
-                    cp "$MERGED_BREWFILE" "$MERGED_DIR/Brewfile${PROFILE_SUFFIX}_$TIMESTAMP"
-                    log_merge "Backed up existing merge file."
-                fi
-                
-                cp "$TEMP_MERGED" "$MERGED_BREWFILE"
-                
-                # Merge statistics
-                MERGED_BREW=$(grep '^brew ' "$MERGED_BREWFILE" | wc -l | tr -d ' ')
-                MERGED_CASK=$(grep '^cask ' "$MERGED_BREWFILE" | wc -l | tr -d ' ')
-                MERGED_MAS=$(grep '^mas ' "$MERGED_BREWFILE" | wc -l | tr -d ' ')
-                
-                log_success "Merge completed! Total packages: Homebrew($MERGED_BREW) Cask($MERGED_CASK) MAS($MERGED_MAS)"
-                log_info "Merge file location: $MERGED_BREWFILE"
-            fi
-            
-            # Create merge info file
-            cat > "$MERGED_DIR/merge_info$PROFILE_SUFFIX.txt" << EOF
-Last merge: $(date)
-Profile: ${PROFILE:-"default"}
-Included Mac count: ${#ALL_BREWFILES[@]}
-Included Macs: $(find "$SEARCH_DIR" -mindepth 1 -maxdepth 1 -type d -exec basename {} \; | tr '\n' ' ')
-Total packages: $(grep -E '^(brew|cask|mas)' "$MERGED_BREWFILE" | wc -l | tr -d ' ')
-EOF
-            
-        else
-            log_merge "Only current Mac found, merge not needed."
-        fi
-    fi
 
     # Clean up temporary directory
     rm -rf "$TEMP_DIR"
 
-    # Clean up old backup files (keep 30 per host)
-    OLD_BACKUPS=$(ls -1 "$HOST_DIR"/Brewfile_* 2>/dev/null | wc -l | tr -d ' ')
-    if [ "$OLD_BACKUPS" -gt 30 ]; then
-        log_info "[$HOSTNAME] Cleaning up old backup files..."
-        ls -1t "$HOST_DIR"/Brewfile_* | tail -n +31 | xargs rm -f
-    fi
-
-    # Clean up old merge files
-    if [ "$MERGE_MODE" = true ] && [ -d "$MERGED_DIR" ]; then
-        OLD_MERGED=$(ls -1 "$MERGED_DIR"/Brewfile${PROFILE_SUFFIX}_* 2>/dev/null | wc -l | tr -d ' ')
-        if [ "$OLD_MERGED" -gt 20 ]; then
-            log_merge "Cleaning up old merge backups..."
-            ls -1t "$MERGED_DIR"/Brewfile${PROFILE_SUFFIX}_* | tail -n +21 | xargs rm -f
+    # Simple cleanup for profile directory
+    if [ "$CHANGES_DETECTED" = true ]; then
+        log_info "Running automatic backup cleanup..."
+        
+        # Remove old backup files in profile directory (keep last 5)
+        if [ -d "$PROFILE_DIR" ]; then
+            find "$PROFILE_DIR" -name "Brewfile_*" -type f | sort -r | tail -n +6 | xargs rm -f 2>/dev/null || true
         fi
+        
+        log_info "Automatic cleanup completed"
     fi
 
     log_success "All operations completed!"
@@ -1008,7 +2256,7 @@ EOF
     if [ "$BACKUP_METHOD" = "git" ] && [ "$CHANGES_DETECTED" = true ]; then
         echo ""
         log_info "🔄 Git backup follow-up actions:"
-        log_info "  Commit changes: git add . && git commit -m \"Update Brewfile from $HOSTNAME\""
+        log_info "  Commit changes: git add . && git commit -m \"Update profile '$PROFILE' from $HOSTNAME\""
         log_info "  Push to remote: git push"
         echo ""
         echo -n "Would you like to commit and push to Git now? (y/N): "
@@ -1016,7 +2264,7 @@ EOF
         if [[ "$git_response" =~ ^[Yy]$ ]]; then
             cd "$BACKUP_DIR"
             git add .
-            if git commit -m "Update Brewfile from $HOSTNAME - $(date)"; then
+            if git commit -m "Update profile '$PROFILE' from $HOSTNAME - $(date "+%Y-%m-%d %H:%M:%S")"; then
                 log_success "Git commit completed"
                 if git push 2>/dev/null; then
                     log_success "Git push completed"
@@ -1048,13 +2296,8 @@ EOF
     esac
 
     if [ "$BACKUP_METHOD" != "git" ]; then
-        log_info "  Individual restore: brew-sync restore --host $HOSTNAME"
-        if [ -n "$PROFILE" ]; then
-            log_info "  Profile restore: brew-sync restore --profile $PROFILE"
-            log_info "  Merged restore: brew-sync restore --profile $PROFILE --merged"
-        else
-            log_info "  Merged restore: brew-sync restore --merged"
-        fi
+        log_info "  Profile restore: brew-sync restore --profile $PROFILE"
+        log_info "  Default restore: brew-sync restore"
         
         # Additional guidance by backup method
         case "$BACKUP_METHOD" in
@@ -1073,8 +2316,6 @@ do_restore() {
     local FORCE=false
     local SKIP_MAS=false
     local VERBOSE=false
-    local USE_MERGED=false
-    local TARGET_HOST=""
     local PROFILE=""
     local CUSTOM_PATH=""
     local USE_GIT=false
@@ -1099,14 +2340,6 @@ do_restore() {
             -v|--verbose)
                 VERBOSE=true
                 shift
-                ;;
-            --merged)
-                USE_MERGED=true
-                shift
-                ;;
-            --host)
-                TARGET_HOST="$2"
-                shift 2
                 ;;
             -p|--profile)
                 PROFILE="$2"
@@ -1208,51 +2441,48 @@ do_restore() {
         BACKUP_METHOD="icloud"
     fi
 
-    # Determine Brewfile path
-    local BACKUP_BREWFILE=""
-    local SOURCE_DESC=""
-    
-    if [ "$USE_MERGED" = true ]; then
-        if [ -n "$PROFILE" ]; then
-            BACKUP_BREWFILE="$BACKUP_DIR/merged/Brewfile_$PROFILE"
-            SOURCE_DESC="Profile '$PROFILE' merged backup"
-        else
-            BACKUP_BREWFILE="$BACKUP_DIR/merged/Brewfile"
-            SOURCE_DESC="All Macs merged backup"
-        fi
-    elif [ -n "$TARGET_HOST" ]; then
-        if [ -n "$PROFILE" ]; then
-            BACKUP_BREWFILE="$BACKUP_DIR/profiles/$PROFILE/$TARGET_HOST/Brewfile"
-            SOURCE_DESC="$TARGET_HOST (profile: $PROFILE)"
-        else
-            BACKUP_BREWFILE="$BACKUP_DIR/hosts/$TARGET_HOST/Brewfile"
-            SOURCE_DESC="$TARGET_HOST Mac individual backup"
-        fi
-    elif [ -n "$PROFILE" ]; then
-        BACKUP_BREWFILE="$BACKUP_DIR/profiles/$PROFILE/$CURRENT_HOSTNAME/Brewfile"
-        SOURCE_DESC="Current Mac's '$PROFILE' profile backup"
-    else
-        BACKUP_BREWFILE="$BACKUP_DIR/hosts/$CURRENT_HOSTNAME/Brewfile"
-        SOURCE_DESC="Current Mac individual backup"
+    # Check for migration before proceeding
+    if check_migration_needed "$BACKUP_DIR"; then
+        migrate_hosts_to_profiles "$BACKUP_DIR" || {
+            log_error "Migration failed. Restore aborted."
+            exit 1
+        }
     fi
 
-    # Check Brewfile existence
+    # Set profile (default to 'default' if not specified)
+    if [ -z "$PROFILE" ]; then
+        PROFILE="$DEFAULT_PROFILE"
+    fi
+
+    # Validate profile name
+    if ! validate_profile_name "$PROFILE"; then
+        log_error "Invalid profile name: '$PROFILE'"
+        log_info "Profile names must be alphanumeric with hyphens/underscores only (max 50 chars)"
+        log_info "Reserved names: hosts, merged, common, .migration"
+        exit 1
+    fi
+
+    # Get profile directory and Brewfile path
+    local PROFILE_DIR
+    PROFILE_DIR=$(get_profile_path "$BACKUP_DIR" "$PROFILE")
+    local BACKUP_BREWFILE="$PROFILE_DIR/Brewfile"
+    
+    # Check if profile exists
     if [ ! -f "$BACKUP_BREWFILE" ]; then
-        log_error "Backup Brewfile not found: $BACKUP_BREWFILE"
-        echo ""
-        log_info "To check available backups: brew-sync list"
-        echo ""
-        log_info "Other options:"
-        if [ "$USE_MERGED" = true ]; then
-            log_info "  Use individual Mac backup: brew-sync restore --host HOSTNAME"
+        log_error "Profile '$PROFILE' not found or no Brewfile exists."
+        log_info "Available profiles:"
+        if get_available_profiles "$BACKUP_DIR" >/dev/null 2>&1; then
+            get_available_profiles "$BACKUP_DIR" | while read -r profile_name; do
+                echo "  - $profile_name"
+            done
         else
-            log_info "  Use merged backup: brew-sync restore --merged"
-        fi
-        if [ -z "$PROFILE" ]; then
-            log_info "  Specify profile: brew-sync restore --profile PROFILE_NAME"
+            echo "  No profiles found."
         fi
         exit 1
     fi
+
+    local SOURCE_DESC="Profile '$PROFILE'"
+
 
     # Check Homebrew installation
     if ! command -v brew &> /dev/null; then
@@ -1273,35 +2503,23 @@ do_restore() {
     if [ "$DRY_RUN" = true ]; then
         log_info "=== DRY RUN mode - No actual installation will be performed ==="
         echo
-        if [ "$USE_MERGED" = true ]; then
-            log_info "  Actual installation: brew-sync restore --merged"
-        elif [ -n "$TARGET_HOST" ]; then
-            log_info "  Actual installation: brew-sync restore --host $TARGET_HOST"
-        elif [ -n "$PROFILE" ]; then
-            log_info "  Actual installation: brew-sync restore --profile $PROFILE"
-        else
-            log_info "  Actual installation: brew-sync restore"
-        fi
+        log_info "  Actual installation: brew-sync restore --profile $PROFILE"
     fi
 
     log_restore "Restore source: $SOURCE_DESC"
     log_info "Brewfile path: $BACKUP_BREWFILE"
 
-    # Output backup information
-    BACKUP_INFO_FILE=$(dirname "$BACKUP_BREWFILE")/backup_info.txt
-    MERGE_INFO_FILE=""
+    # Output profile information
+    BACKUP_INFO_FILE="$PROFILE_DIR/backup_info.txt"
+    METADATA_FILE="$PROFILE_DIR/metadata.json"
 
-    if [ "$USE_MERGED" = true ]; then
-        if [ -n "$PROFILE" ]; then
-            MERGE_INFO_FILE="$BACKUP_DIR/merged/merge_info_$PROFILE.txt"
+    if [ -f "$METADATA_FILE" ]; then
+        log_info "Profile information:"
+        if command -v jq >/dev/null 2>&1; then
+            jq -r '"  Last backup: " + .last_backup + "\n  From host: " + .hostname + "\n  Packages: brew(" + (.package_count.brew | tostring) + ") cask(" + (.package_count.cask | tostring) + ") mas(" + (.package_count.mas | tostring) + ")"' "$METADATA_FILE"
         else
-            MERGE_INFO_FILE="$BACKUP_DIR/merged/merge_info.txt"
+            grep -E '"(last_backup|hostname)"' "$METADATA_FILE" | sed 's/^/  /'
         fi
-    fi
-
-    if [ -f "$MERGE_INFO_FILE" ]; then
-        log_info "Merged backup information:"
-        cat "$MERGE_INFO_FILE" | sed 's/^/  /'
         echo
     elif [ -f "$BACKUP_INFO_FILE" ]; then
         log_info "Backup information:"
@@ -1406,28 +2624,11 @@ do_restore() {
         log_info "  - Check sync: brew bundle check --file=\"$TEMP_BREWFILE\""
         log_info "  - Full list: brew list"
         
-        # Additional restore options guidance
-        if [ "$USE_MERGED" = false ]; then
-            echo ""
-            log_info "💡 Other restore options:"
-            log_info "  All Mac packages: brew-sync restore --merged"
-            if [ -n "$PROFILE" ]; then
-                log_info "  Profile merged: brew-sync restore --profile $PROFILE --merged"
-            fi
-        fi
     else
         log_info "[DRY-RUN] For actual installation, run again without -d option"
         echo ""
-        log_info "💡 Recommended commands:"
-        if [ "$USE_MERGED" = true ]; then
-            log_info "  Actual installation: brew-sync restore --merged"
-        elif [ -n "$TARGET_HOST" ]; then
-            log_info "  Actual installation: brew-sync restore --host $TARGET_HOST"
-        elif [ -n "$PROFILE" ]; then
-            log_info "  Actual installation: brew-sync restore --profile $PROFILE"
-        else
-            log_info "  Actual installation: brew-sync restore"
-        fi
+        log_info "💡 Recommended command:"
+        log_info "  Actual installation: brew-sync restore --profile $PROFILE"
     fi
     
     # Cleanup temporary directory
@@ -1435,6 +2636,7 @@ do_restore() {
         rm -rf "$TEMP_BREWFILE_DIR"
         log_info "Cleaned up temporary files"
     fi
+    
 }
 
 # Function: Print update usage
@@ -1640,6 +2842,14 @@ case "$1" in
         # Auto-detect backup location for listing
         detect_backup_location 2>/dev/null || BACKUP_DIR="$DEFAULT_BACKUP_DIR"
         list_backups
+        ;;
+    profile)
+        shift
+        manage_profiles "$@"
+        ;;
+    cleanup)
+        shift
+        do_cleanup "$@"
         ;;
     update)
         shift

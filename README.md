@@ -21,14 +21,14 @@ That's it! All your Homebrew packages, GUI apps, and Mac App Store apps are now 
 ## Key Features
 
 - **🚀 Smart setup**: First-time interactive setup with intelligent defaults
-- **🔄 Multi-Mac sync**: Combines packages from all your machines
+- **🔄 Multi-Mac sync**: Organized by profiles for different use cases
 - **☁️ Flexible storage**: iCloud, Dropbox, Google Drive, Git, or local-only
 - **💻 Local option**: `.brew-sync` for single-Mac or privacy-conscious users
 - **📱 Complete coverage**: Homebrew + Cask apps + Mac App Store apps  
 - **🏷️ Profiles**: Different setups for work, personal, development
 - **🔍 Preview mode**: `--dry-run` to see what will be installed
 - **⚡ Simple**: Just `backup` and `restore` - auto-detects everything
-- **🔄 Backward compatible**: Existing setups continue working unchanged
+- **🔄 Auto-migration**: Existing host-based setups automatically migrate to profiles
 
 ## Installation
 
@@ -64,7 +64,7 @@ brew-sync restore              # Actually install
 
 # Use profiles for different setups
 brew-sync backup --profile work
-brew-sync restore --profile work --merged
+brew-sync restore --profile work
 
 # Utility commands
 brew-sync list                 # List available backups
@@ -89,9 +89,9 @@ $ brew-sync backup --profile work
 ✓ All operations completed!
 
 # Home iMac: restore the same setup  
-$ brew-sync restore --profile work --merged
+$ brew-sync restore --profile work
 • iCloud Drive detected: ~/Library/Mobile Documents/com~apple~CloudDocs/brew-backup
-→ Restore source: Profile 'work' merged backup
+→ Restore source: Profile 'work'
 • Package information to restore:
 •   - Homebrew packages: 47
 •   - Cask apps: 12
@@ -127,14 +127,13 @@ brew-sync backup --select-storage   # Interactive selection (saves new default)
 ### Restore Options
 ```bash
 # What to restore
-brew-sync restore                   # Your Mac's backup (default)
-brew-sync restore --merged          # All Macs combined
-brew-sync restore --host MacBook-Pro # Specific Mac's backup
-brew-sync restore --profile work    # Specific profile
+brew-sync restore                   # Default profile backup
+brew-sync restore --profile work    # Work profile backup
+brew-sync restore --profile dev     # Development profile backup
 
 # Where to restore from (temporary overrides)
-brew-sync restore --icloud --merged # From iCloud, all Macs
-brew-sync restore --git --host MyMac # From Git, specific Mac
+brew-sync restore --icloud --profile work # From iCloud, work profile
+brew-sync restore --git --profile dev     # From Git, dev profile
 
 # Preview and change defaults
 brew-sync restore --dry-run         # Preview only (recommended)

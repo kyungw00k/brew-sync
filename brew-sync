@@ -13,6 +13,7 @@ SCRIPT_PATH="${BASH_SOURCE[0]}"
 ICLOUD_PATH="$HOME/Library/Mobile Documents/com~apple~CloudDocs"
 BREW_SYNC_CONFIG_DIR="$HOME/.config/brew-sync"
 LAST_STORAGE_FILE="$BREW_SYNC_CONFIG_DIR/last_storage"
+DEFAULT_PROFILE_FILE="$BREW_SYNC_CONFIG_DIR/default_profile"
 # Set default backup directory based on platform
 BREW_SYNC_LOCAL_DIR="$HOME/.brew-sync"
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -694,6 +695,26 @@ load_last_storage() {
     return 1
 }
 
+# Function: Save default profile
+save_default_profile() {
+    local profile="$1"
+    
+    # Create config directory if it doesn't exist
+    mkdir -p "$BREW_SYNC_CONFIG_DIR"
+    
+    # Save default profile
+    echo "$profile" > "$DEFAULT_PROFILE_FILE"
+}
+
+# Function: Load default profile
+load_default_profile() {
+    if [ -f "$DEFAULT_PROFILE_FILE" ]; then
+        cat "$DEFAULT_PROFILE_FILE"
+        return 0
+    fi
+    return 1
+}
+
 # Function: First-time setup for storage selection
 first_time_setup() {
     echo ""
@@ -774,6 +795,128 @@ first_time_setup() {
     echo ""
     log_success "Storage configured: $method ($path)" >&2
     echo "$method|$path"
+}
+
+# Function: First-time profile setup
+first_time_profile_setup() {
+    local backup_dir="$1"
+    local profiles_dir="$backup_dir/$PROFILES_DIR"
+    
+    echo ""
+    log_info "🔧 Profile Setup"
+    echo ""
+    
+    # Check for existing profiles
+    local -a existing_profiles=()
+    if [ -d "$profiles_dir" ]; then
+        while IFS= read -r line; do
+            if [ -n "$line" ]; then
+                existing_profiles+=("$line")
+            fi
+        done < <(get_available_profiles "$backup_dir" 2>/dev/null)
+    fi
+    
+    # If existing profiles found, show them
+    if [ ${#existing_profiles[@]} -gt 0 ]; then
+        echo "Found existing profiles:"
+        echo "┌─────────────────────┬─────────────┬──────────────┐"
+        echo "│ Profile             │ Packages    │ Last Updated │"
+        echo "├─────────────────────┼─────────────┼──────────────┤"
+        
+        for profile_name in "${existing_profiles[@]}"; do
+            local profile_dir="$profiles_dir/$profile_name"
+            local pkg_count=0
+            local last_date="never"
+            
+            if [ -f "$profile_dir/Brewfile" ]; then
+                pkg_count=$(grep -c "^brew\|^cask\|^mas" "$profile_dir/Brewfile" 2>/dev/null || echo "0")
+                last_date=$(stat -f %Sm -t "%Y-%m-%d" "$profile_dir/Brewfile" 2>/dev/null || echo "never")
+            fi
+            
+            printf "│ %-19s │ %-11s │ %-12s │\n" "$profile_name" "$pkg_count pkgs" "$last_date"
+        done
+        
+        echo "└─────────────────────┴─────────────┴──────────────┘"
+        echo ""
+    fi
+    
+    # Suggest profile name based on hostname
+    local suggested_profile
+    suggested_profile=$(suggest_profile_name "$CURRENT_HOSTNAME")
+    
+    echo "Setup options:"
+    echo "1) Use 'default' profile (recommended)"
+    if [ ${#existing_profiles[@]} -gt 0 ]; then
+        echo "2) Use existing profile from list above"
+    fi
+    echo "3) Create new profile based on hostname ('$suggested_profile')"
+    echo "4) Enter custom profile name"
+    echo ""
+    
+    local max_option=4
+    if [ ${#existing_profiles[@]} -eq 0 ]; then
+        max_option=3
+    fi
+    
+    echo -n "Select option (1-$max_option): "
+    read -r profile_choice
+    
+    local selected_profile=""
+    
+    case "$profile_choice" in
+        1)
+            selected_profile="$DEFAULT_PROFILE"
+            ;;
+        2)
+            if [ ${#existing_profiles[@]} -gt 0 ]; then
+                echo ""
+                echo "Select profile:"
+                local j=1
+                for profile_name in "${existing_profiles[@]}"; do
+                    echo "$j) $profile_name"
+                    ((j++))
+                done
+                echo -n "Enter choice (1-${#existing_profiles[@]}): "
+                read -r profile_selection
+                
+                if [[ "$profile_selection" =~ ^[0-9]+$ ]] && [ "$profile_selection" -ge 1 ] && [ "$profile_selection" -le ${#existing_profiles[@]} ]; then
+                    selected_profile="${existing_profiles[$((profile_selection-1))]}"
+                else
+                    log_error "Invalid selection. Using 'default' profile."
+                    selected_profile="$DEFAULT_PROFILE"
+                fi
+            else
+                log_error "Invalid selection. Using 'default' profile."
+                selected_profile="$DEFAULT_PROFILE"
+            fi
+            ;;
+        3)
+            selected_profile="$suggested_profile"
+            ;;
+        4)
+            echo -n "Enter profile name: "
+            read -r custom_profile
+            if validate_profile_name "$custom_profile"; then
+                selected_profile="$custom_profile"
+            else
+                log_error "Invalid profile name. Using 'default' profile."
+                selected_profile="$DEFAULT_PROFILE"
+            fi
+            ;;
+        *)
+            log_error "Invalid selection. Using 'default' profile."
+            selected_profile="$DEFAULT_PROFILE"
+            ;;
+    esac
+    
+    # Save the selected profile as default
+    save_default_profile "$selected_profile"
+    
+    echo ""
+    log_success "Default profile set to: $selected_profile"
+    echo ""
+    
+    return 0
 }
 
 # Function: Interactive storage selection
@@ -941,7 +1084,8 @@ backup_usage() {
     echo "  brew-sync backup --select-storage   # Choose and save as default"
     echo "  brew-sync backup -p dev             # Backup dev profile"
     echo ""
-    echo "Note: Only --select-storage changes your default. Other options are temporary."
+    echo "Note: Only --select-storage changes your default storage location."
+    echo "      The default profile is loaded from ~/.config/brew-sync/default_profile if it exists."
     echo "For all options: brew-sync backup --help-all"
 }
 
@@ -1003,7 +1147,8 @@ restore_usage() {
     echo "  brew-sync restore --profile work    # Restore work profile"
     echo "  brew-sync restore -p dev --dry-run  # Preview dev profile"
     echo ""
-    echo "Note: Only --select-storage changes your default. Other options are temporary."
+    echo "Note: Only --select-storage changes your default storage location."
+    echo "      The default profile is loaded from ~/.config/brew-sync/default_profile if it exists."
     echo "For all options: brew-sync restore --help-all"
 }
 
@@ -1057,6 +1202,12 @@ detect_backup_location() {
         
         BACKUP_DIR="$path"
         BACKUP_METHOD="$method"
+        
+        # After storage setup, check for profile setup
+        if ! load_default_profile >/dev/null 2>&1; then
+            first_time_profile_setup "$BACKUP_DIR"
+        fi
+        
         return 0
     fi
     
@@ -2114,7 +2265,12 @@ do_backup() {
 
     # Set profile (default to 'default' if not specified)
     if [ -z "$PROFILE" ]; then
-        PROFILE="$DEFAULT_PROFILE"
+        # Try to load default profile from config
+        if loaded_profile=$(load_default_profile); then
+            PROFILE="$loaded_profile"
+        else
+            PROFILE="$DEFAULT_PROFILE"
+        fi
     fi
 
     # Validate profile name
@@ -2451,7 +2607,12 @@ do_restore() {
 
     # Set profile (default to 'default' if not specified)
     if [ -z "$PROFILE" ]; then
-        PROFILE="$DEFAULT_PROFILE"
+        # Try to load default profile from config
+        if loaded_profile=$(load_default_profile); then
+            PROFILE="$loaded_profile"
+        else
+            PROFILE="$DEFAULT_PROFILE"
+        fi
     fi
 
     # Validate profile name
@@ -2694,6 +2855,8 @@ uninstall_brew_sync() {
             log_info "If you want to remove backup files, manually delete them from:"
             log_info "  - iCloud Drive: ~/Library/Mobile Documents/com~apple~CloudDocs/brew-backup"
             log_info "  - Other locations you may have configured"
+            log_info ""
+            log_info "Configuration files in ~/.config/brew-sync/ will also remain."
             ;;
         *)
             log_info "Uninstall cancelled."

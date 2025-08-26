@@ -26,6 +26,7 @@ That's it! All your Homebrew packages, GUI apps, and Mac App Store apps are now 
 - **💻 Local option**: `.brew-sync` for single-Mac or privacy-conscious users
 - **📱 Complete coverage**: Homebrew + Cask apps + Mac App Store apps  
 - **🏷️ Profiles**: Different setups for work, personal, development
+- **🤖 Machine-specific defaults**: Automatically loads per-machine default profile
 - **🔍 Preview mode**: `--dry-run` to see what will be installed
 - **⚡ Simple**: Just `backup` and `restore` - auto-detects everything
 - **🔄 Auto-migration**: Existing host-based setups automatically migrate to profiles
@@ -51,6 +52,26 @@ brew-sync backup
 #  3) Local storage (.brew-sync) 💻 Stays on this Mac only
 #
 # Select storage (1-3, press Enter for 2): 
+#
+# After storage setup, you'll configure your default profile:
+#
+# 🔧 Profile Setup
+#
+# Found existing profiles:
+# ┌─────────────────────┬─────────────┬──────────────┐
+# │ Profile             │ Packages    │ Last Updated │
+# ├─────────────────────┼─────────────┼──────────────┤
+# │ default             │ 120 pkgs    │ 2024-01-15   │
+# │ work                │ 85 pkgs     │ 2024-01-10   │
+# └─────────────────────┴─────────────┴──────────────┘
+#
+# Setup options:
+# 1) Use 'default' profile (recommended)
+# 2) Use existing profile from list above
+# 3) Create new profile based on hostname ('mbp')
+# 4) Enter custom profile name
+#
+# Select option (1-4): 
 ```
 
 ### Daily Usage
@@ -65,6 +86,15 @@ brew-sync restore              # Actually install
 # Use profiles for different setups
 brew-sync backup --profile work
 brew-sync restore --profile work
+
+# Machine-specific default profile (automatically loaded from ~/.config/brew-sync/default_profile)
+brew-sync backup                  # Uses machine-specific default profile
+brew-sync restore                 # Uses machine-specific default profile
+
+# Profile management commands
+brew-sync profile list            # List all profiles
+brew-sync profile show work       # Show details of work profile
+brew-sync profile remove old      # Remove old profile (except 'default')
 
 # Utility commands
 brew-sync list                 # List available backups
@@ -127,7 +157,7 @@ brew-sync backup --select-storage   # Interactive selection (saves new default)
 ### Restore Options
 ```bash
 # What to restore
-brew-sync restore                   # Default profile backup
+brew-sync restore                   # Default profile backup (loads machine-specific default)
 brew-sync restore --profile work    # Work profile backup
 brew-sync restore --profile dev     # Development profile backup
 

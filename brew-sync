@@ -193,11 +193,24 @@ backup_original_data() {
 # Function: Create migration completion flag
 create_migration_flag() {
     local backup_dir="$1"
+    local migration_type="$2"
+    local host_info="$3"
     local migration_flag_file="$backup_dir/$MIGRATION_DIR/$MIGRATION_FLAG"
     
     mkdir -p "$(dirname "$migration_flag_file")"
-    echo "Migration completed on $(date)" > "$migration_flag_file"
-    log_success "Migration flag created"
+    
+    # Create detailed migration metadata
+    cat > "$migration_flag_file" <<EOF
+{
+  "migration_completed": "$(date -Iseconds)",
+  "migration_type": "$migration_type",
+  "host_info": $host_info,
+  "backup_location": "$backup_dir",
+  "script_version": "profile-refactor"
+}
+EOF
+    
+    log_success "Migration flag created with detailed metadata"
 }
 
 # Function: Migrate single host to default profile
@@ -556,6 +569,47 @@ migrate_multiple_hosts() {
     return 0
 }
 
+# Function: Check if path is symbolic link and get target
+is_symbolic_link() {
+    local path="$1"
+    if [ -L "$path" ]; then
+        local target=$(readlink "$path")
+        # If target is relative, make it absolute
+        if [[ "$target" != /* ]]; then
+            target="$(dirname "$path")/$target"
+        fi
+        echo "$target"
+        return 0
+    fi
+    return 1
+}
+
+# Function: Remove original hosts directory after migration
+remove_original_hosts() {
+    local backup_dir="$1"
+    local hosts_dir="$backup_dir/$HOSTS_DIR"
+    
+    if [ ! -d "$hosts_dir" ]; then
+        return 0
+    fi
+    
+    # Check if hosts directory is a symbolic link
+    if [ -L "$hosts_dir" ]; then
+        local target
+        target=$(is_symbolic_link "$hosts_dir")
+        log_info "Removing symbolic link: $hosts_dir -> $target"
+        rm "$hosts_dir"
+        log_success "Symbolic link removed"
+    else
+        # Regular directory - remove it completely
+        log_info "Removing original hosts directory..."
+        rm -rf "$hosts_dir"
+        log_success "Original hosts directory removed"
+    fi
+    
+    return 0
+}
+
 # Function: Main migration orchestrator
 migrate_hosts_to_profiles() {
     local backup_dir="$1"
@@ -573,32 +627,67 @@ migrate_hosts_to_profiles() {
         return 1
     fi
     
-    # Count hosts
+    # Count hosts and collect host info
     local host_count
     host_count=$(find "$hosts_dir" -maxdepth 1 -type d ! -path "$hosts_dir" | wc -l | tr -d ' ')
+    
+    # Collect host information for metadata
+    local host_info="[]"
+    if [ "$host_count" -gt 0 ]; then
+        host_info="["
+        local first_host=true
+        for host_dir in "$hosts_dir"/*; do
+            if [ -d "$host_dir" ]; then
+                if [ "$first_host" = false ]; then
+                    host_info="$host_info,"
+                fi
+                local hostname
+                hostname=$(basename "$host_dir")
+                local is_symlink="false"
+                local symlink_target=""
+                if [ -L "$host_dir" ]; then
+                    is_symlink="true"
+                    symlink_target=$(readlink "$host_dir")
+                fi
+                host_info="$host_info{\"name\":\"$hostname\",\"path\":\"$host_dir\",\"is_symlink\":$is_symlink,\"symlink_target\":\"$symlink_target\"}"
+                first_host=false
+            fi
+        done
+        host_info="$host_info]"
+    fi
+    
+    local migration_type="unknown"
     
     case $host_count in
         0)
             log_warning "No host backups found."
+            migration_type="no-hosts"
             ;;
         1)
             migrate_single_host "$backup_dir" || return 1
+            migration_type="single-host"
             ;;
         2)
             migrate_two_hosts "$backup_dir" || return 1
+            migration_type="two-hosts"
             ;;
         *)
             migrate_multiple_hosts "$backup_dir" || return 1
+            migration_type="multiple-hosts"
             ;;
     esac
     
-    # Create migration completion flag
-    create_migration_flag "$backup_dir"
+    # Create migration completion flag with detailed metadata
+    create_migration_flag "$backup_dir" "$migration_type" "$host_info"
+    
+    # Remove original hosts directory
+    remove_original_hosts "$backup_dir"
     
     log_success "✓ Migration completed successfully!"
     echo
     log_info "Your backup structure has been updated to use profiles."
-    log_info "Original data is preserved in $backup_dir/$MIGRATION_DIR/backup/"
+    log_info "Original data was backed up to $backup_dir/$MIGRATION_DIR/backup/"
+    log_info "Legacy hosts directory has been removed to complete migration."
     
     return 0
 }

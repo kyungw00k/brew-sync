@@ -1516,9 +1516,21 @@ validate_profile_exists() {
 # Function: Profile management
 manage_profiles() {
     local command="$1"
-    shift
+    [ $# -gt 0 ] && shift
     
     case "$command" in
+        "")
+            # Show current default profile and available commands
+            if [ -f "$DEFAULT_PROFILE_FILE" ]; then
+                echo "Current default profile: $(cat "$DEFAULT_PROFILE_FILE")"
+            else
+                echo "No default profile set"
+                echo "Use 'brew-sync profile set PROFILE' to set a default profile"
+            fi
+            echo ""
+            echo "Available commands: set, show, remove, edit"
+            echo "Use 'brew-sync profile --help' for detailed usage"
+            ;;
         set)
             local profile_name="$1"
             if [ -z "$profile_name" ]; then
@@ -1562,8 +1574,12 @@ manage_profiles() {
             profile_usage
             ;;
         *)
+            echo "Current default profile: $(load_default_profile 2>/dev/null || echo 'none')"
+            echo ""
+            echo "Available commands: set, show, remove, edit"
+            echo "Use 'brew-sync profile --help' for detailed usage"
+            echo ""
             log_error "Unknown profile command: $command"
-            profile_usage
             exit 1
             ;;
     esac
@@ -1739,7 +1755,7 @@ profile_usage() {
     echo "Commands:"
     echo "  show PROFILE            Show profile details and statistics"
     echo "  set PROFILE             Set profile as default"
-    echo "  get                     Show current default profile"
+    echo "  get                     Get current default profile (for scripting)"
     echo "  remove PROFILE          Remove profile (except 'default')"
     echo ""
     echo "Examples:"

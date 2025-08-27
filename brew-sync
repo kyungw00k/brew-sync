@@ -1684,10 +1684,19 @@ remove_profile() {
 # Function: Show profile
 show_profile() {
     local profile_name="$1"
+    local using_default=false
     
+    # If no profile specified, use default profile
     if [ -z "$profile_name" ]; then
-        log_error "Usage: brew-sync profile show PROFILE_NAME"
-        exit 1
+        if [ -f "$DEFAULT_PROFILE_FILE" ]; then
+            profile_name=$(cat "$DEFAULT_PROFILE_FILE")
+            using_default=true
+        else
+            log_error "No default profile set"
+            echo "Use 'brew-sync profile set PROFILE' to set a default profile"
+            echo "Or specify a profile: brew-sync profile show PROFILE"
+            exit 1
+        fi
     fi
     
     if ! validate_profile_name "$profile_name"; then
@@ -1701,7 +1710,11 @@ show_profile() {
     local profile_dir="$BACKUP_DIR/$PROFILES_DIR/$profile_name"
     
     if [ -d "$profile_dir" ]; then
-        echo "Profile: $profile_name"
+        if [ "$using_default" = true ]; then
+            echo "Profile: $profile_name (default)"
+        else
+            echo "Profile: $profile_name"
+        fi
         echo "Path: $profile_dir"
         echo ""
         

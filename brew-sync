@@ -44,29 +44,45 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
-# Common logging functions
+# Global flags
+VERBOSE=false
+
+# Enhanced logging functions with verbose support
 log_info() {
-    echo -e "${BLUE}•${NC} $1"
+    echo -e "${BLUE}$1${NC}"
 }
 
 log_success() {
-    echo -e "${GREEN}✓${NC} $1"
+    echo -e "${GREEN}$1${NC}"
 }
 
 log_warning() {
-    echo -e "${YELLOW}!${NC} $1"
+    echo -e "${YELLOW}$1${NC}"
 }
 
 log_error() {
-    echo -e "${RED}✗${NC} $1"
+    echo -e "${RED}$1${NC}"
 }
 
+log_verbose() {
+    if [ "$VERBOSE" = true ]; then
+        echo -e "${BLUE}  $1${NC}"
+    fi
+}
+
+log_debug() {
+    if [ "$VERBOSE" = true ]; then
+        echo -e "${CYAN}  DEBUG: $1${NC}"
+    fi
+}
+
+# Backward compatibility aliases
 log_merge() {
-    echo -e "${CYAN}+${NC} $1"
+    log_info "$1"
 }
 
 log_restore() {
-    echo -e "${CYAN}→${NC} $1"
+    log_info "$1"
 }
 
 # Migration functions
@@ -1199,6 +1215,7 @@ backup_usage() {
     echo ""
     echo "Common options:"
     echo "  -p, --profile NAME   Use profile (e.g., dev, design)"
+    echo "  -v, --verbose        Show detailed progress information"
     echo "  --select-storage     Choose storage location interactively (**saves as default**)"
     echo "  --git                Backup to Git repository (temporary)"
     echo "  --icloud             Backup to iCloud Drive (temporary)"
@@ -1266,6 +1283,7 @@ restore_usage() {
     echo ""
     echo "Other options:"
     echo "  -d, --dry-run        Preview only (recommended first)"
+    echo "  -v, --verbose        Show detailed installation progress"
     echo "  -l, --list           List available backups"
     echo ""
     echo "Examples:"
@@ -2148,8 +2166,9 @@ EOF
     # Determine editor to use
     local editor="${EDITOR:-${VISUAL:-nano}}"
     
-    log_info "Opening Brewfile for profile '$profile_name' with $editor"
-    echo "You will be editing a temporary copy. Changes will only be applied after confirmation."
+    log_info "Editing profile '$profile_name'"
+    log_verbose "Editor: $editor"
+    log_verbose "Temporary editing - changes applied after confirmation"
     echo ""
     echo "Press any key to continue..."
     read -r -n 1
@@ -2761,6 +2780,10 @@ do_backup() {
                 AUTO_DETECT=false
                 shift 2
                 ;;
+            -v|--verbose)
+                VERBOSE=true
+                shift
+                ;;
             -h|--help)
                 backup_usage
                 exit 0
@@ -2844,20 +2867,18 @@ do_backup() {
     # Create backup directories
     mkdir -p "$PROFILE_DIR"
 
-    log_info "Starting Brewfile backup..."
-    log_info "Profile: $PROFILE"
-    log_info "Host: $HOSTNAME"
+    log_verbose "Starting backup for profile '$PROFILE' on host '$HOSTNAME'"
 
     # Generate Brewfile in temporary directory
     TEMP_DIR=$(mktemp -d)
     cd "$TEMP_DIR"
 
     # Generate Brewfile
-    log_info "Generating current package list..."
-    if brew bundle dump --force; then
-        log_success "Brewfile generation completed"
+    log_verbose "Generating current package list..."
+    if brew bundle dump --force >/dev/null 2>&1; then
+        log_verbose "Package list generated successfully"
     else
-        log_error "Brewfile generation failed"
+        log_error "Failed to generate package list"
         rm -rf "$TEMP_DIR"
         exit 1
     fi
@@ -2904,9 +2925,11 @@ EOF
     CASK_COUNT=$(grep '^cask ' "$PROFILE_BREWFILE" | wc -l | tr -d ' ')
     MAS_COUNT=$(grep '^mas ' "$PROFILE_BREWFILE" | wc -l | tr -d ' ')
 
-    log_success "[$HOSTNAME] Backup completed!"
-    log_info "Backup location: $PROFILE_BREWFILE"
-    log_info "Package statistics: Homebrew($BREW_COUNT) Cask($CASK_COUNT) MAS($MAS_COUNT)"
+    # Show summary based on verbosity
+    local total_packages=$((BREW_COUNT + CASK_COUNT + MAS_COUNT))
+    log_success "Backup completed ($total_packages packages)"
+    log_verbose "Location: $PROFILE_BREWFILE"
+    log_verbose "Packages: $BREW_COUNT brew, $CASK_COUNT cask, $MAS_COUNT MAS apps"
     
     # Create metadata.json for the profile
     cat > "$PROFILE_DIR/metadata.json" <<EOF
@@ -3008,7 +3031,6 @@ do_restore() {
     local DRY_RUN=false
     local FORCE=false
     local SKIP_MAS=false
-    local VERBOSE=false
     local PROFILE=""
     local CUSTOM_PATH=""
     local USE_GIT=false
@@ -3262,14 +3284,14 @@ do_restore() {
 
     if [ "$SKIP_MAS" = true ]; then
         BUNDLE_ARGS="$BUNDLE_ARGS --no-mas"
-        log_info "Skipping Mac App Store app installation"
+        log_verbose "Skipping Mac App Store app installation"
     fi
 
-    # Start package installation
-    log_restore "Starting package installation..."
+    # Start package installation  
+    log_verbose "Starting package installation from $TEMP_BREWFILE"
 
     if [ "$DRY_RUN" = true ]; then
-        log_info "[DRY-RUN] Running brew bundle check"
+        log_verbose "[DRY-RUN] Checking package requirements"
         if brew bundle check --file="$TEMP_BREWFILE" --no-upgrade 2>/dev/null; then
             log_info "[DRY-RUN] All packages are already installed"
         else
@@ -3284,10 +3306,10 @@ do_restore() {
         fi
     else
         # Perform actual installation
-        log_info "Running brew bundle..."
+        log_verbose "Executing: brew bundle --file=\"$TEMP_BREWFILE\" $BUNDLE_ARGS"
         
         if brew bundle --file="$TEMP_BREWFILE" $BUNDLE_ARGS; then
-            log_success "All packages installed successfully!"
+            log_success "Restore completed successfully!"
         else
             log_warning "Some package installations may have failed."
             log_info "Check the output above for details."

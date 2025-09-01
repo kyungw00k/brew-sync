@@ -172,6 +172,132 @@ get_profile_path() {
     echo "$backup_dir/$PROFILES_DIR/$profile"
 }
 
+# Function: Recommend profile based on hostname matching
+recommend_profile() {
+    local backup_dir="$1"
+    local current_hostname="$2"
+    local profiles_dir="$backup_dir/$PROFILES_DIR"
+    
+    # First check if any profile has metadata matching current hostname
+    if [ -d "$profiles_dir" ]; then
+        for profile_dir in "$profiles_dir"/*; do
+            if [ -d "$profile_dir" ] && [ -f "$profile_dir/Brewfile" ]; then
+                local profile_name
+                profile_name=$(basename "$profile_dir")
+                
+                # Check metadata for hostname match
+                if [ -f "$profile_dir/metadata.json" ]; then
+                    if command -v jq >/dev/null 2>&1; then
+                        local hostname_from_meta
+                        hostname_from_meta=$(jq -r '.hostname // empty' "$profile_dir/metadata.json" 2>/dev/null)
+                        if [ -n "$hostname_from_meta" ] && [ "$hostname_from_meta" = "$current_hostname" ]; then
+                            echo "$profile_name"
+                            return 0
+                        fi
+                        
+                        # Also check created_from_host field (from migration)
+                        local created_from_host
+                        created_from_host=$(jq -r '.created_from_host // empty' "$profile_dir/metadata.json" 2>/dev/null)
+                        if [ -n "$created_from_host" ] && [ "$created_from_host" = "$current_hostname" ]; then
+                            echo "$profile_name"
+                            return 0
+                        fi
+                    fi
+                fi
+            fi
+        done
+    fi
+    
+    # If no hostname match found, recommend default profile
+    echo "$DEFAULT_PROFILE"
+    return 0
+}
+
+# Function: Interactive profile selection for edit command
+select_profile_for_edit() {
+    local backup_dir="$1"
+    local current_hostname="$2"
+    
+    # Get available profiles
+    local -a available_profiles=()
+    if get_available_profiles "$backup_dir" >/dev/null 2>&1; then
+        while read -r profile_name; do
+            available_profiles+=("$profile_name")
+        done < <(get_available_profiles "$backup_dir")
+    fi
+    
+    # If no profiles exist, create default profile
+    if [ ${#available_profiles[@]} -eq 0 ]; then
+        log_error "No profiles found. You need to create a profile first."
+        echo "Run 'brew-sync backup' to create your first profile."
+        exit 1
+    fi
+    
+    # Get recommended profile
+    local recommended_profile
+    recommended_profile=$(recommend_profile "$backup_dir" "$current_hostname")
+    
+    # If only one profile exists and it's the recommended one, use it
+    if [ ${#available_profiles[@]} -eq 1 ] && [ "${available_profiles[0]}" = "$recommended_profile" ]; then
+        echo "$recommended_profile"
+        return 0
+    fi
+    
+    # Show profile selection dialog
+    echo "Select a profile to edit:"
+    echo ""
+    
+    # Show available profiles with recommendation
+    local i=1
+    for profile_name in "${available_profiles[@]}"; do
+        if [ "$profile_name" = "$recommended_profile" ]; then
+            echo "  $i) $profile_name (recommended - matches current hostname)"
+        else
+            echo "  $i) $profile_name"
+        fi
+        ((i++))
+    done
+    
+    echo ""
+    
+    # Show which profile is recommended and why
+    if [[ " ${available_profiles[*]} " =~ " $recommended_profile " ]]; then
+        local rec_index=0
+        for j in "${!available_profiles[@]}"; do
+            if [ "${available_profiles[j]}" = "$recommended_profile" ]; then
+                rec_index=$((j + 1))
+                break
+            fi
+        done
+        echo -n "Enter your choice (1-${#available_profiles[@]}) [default: $rec_index]: "
+    else
+        echo -n "Enter your choice (1-${#available_profiles[@]}): "
+    fi
+    
+    read -r choice
+    
+    # Handle default selection (recommended profile)
+    if [ -z "$choice" ] && [[ " ${available_profiles[*]} " =~ " $recommended_profile " ]]; then
+        for j in "${!available_profiles[@]}"; do
+            if [ "${available_profiles[j]}" = "$recommended_profile" ]; then
+                choice=$((j + 1))
+                break
+            fi
+        done
+    fi
+    
+    # Validate choice
+    if ! [[ "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 1 ] || [ "$choice" -gt ${#available_profiles[@]} ]; then
+        log_error "Invalid choice"
+        exit 1
+    fi
+    
+    # Return selected profile
+    local selected_index=$((choice - 1))
+    echo "${available_profiles[selected_index]}"
+    return 0
+}
+
 # Function: Backup original host data before migration
 backup_original_data() {
     local backup_dir="$1"
@@ -1570,6 +1696,9 @@ manage_profiles() {
         show)
             show_profile "$@"
             ;;
+        edit)
+            edit_profile "$@"
+            ;;
         help|--help|-h)
             profile_usage
             ;;
@@ -1761,6 +1890,339 @@ show_profile() {
     fi
 }
 
+# Function: Parse Brewfile and extract packages by type
+parse_brewfile() {
+    local brewfile="$1"
+    local output_file="$2"
+    
+    # Clear the output file
+    > "$output_file"
+    
+    if [ ! -f "$brewfile" ]; then
+        return 0
+    fi
+    
+    # Parse packages and write to output file in format: type:package
+    while IFS= read -r line; do
+        if [[ $line =~ ^[[:space:]]*brew[[:space:]]+\"([^\"]+)\" ]]; then
+            echo "brew:${BASH_REMATCH[1]}" >> "$output_file"
+        elif [[ $line =~ ^[[:space:]]*cask[[:space:]]+\"([^\"]+)\" ]]; then
+            echo "cask:${BASH_REMATCH[1]}" >> "$output_file"
+        elif [[ $line =~ ^[[:space:]]*mas[[:space:]]+\"([^\"]+)\" ]]; then
+            echo "mas:${BASH_REMATCH[1]}" >> "$output_file"
+        fi
+    done < "$brewfile"
+}
+
+# Function: Compare two Brewfiles and identify differences
+compare_brewfiles() {
+    local old_brewfile="$1"
+    local new_brewfile="$2"
+    local output_file="$3"
+    
+    # Create temporary files for parsing
+    local temp_dir=$(mktemp -d)
+    local old_parsed="$temp_dir/old.txt"
+    local new_parsed="$temp_dir/new.txt"
+    
+    # Parse both files
+    parse_brewfile "$old_brewfile" "$old_parsed"
+    parse_brewfile "$new_brewfile" "$new_parsed"
+    
+    # Clear output file and write sections
+    > "$output_file"
+    echo "# Added packages" >> "$output_file"
+    
+    # Find added packages
+    while IFS=: read -r type package; do
+        if ! grep -q "^$type:$package$" "$old_parsed" 2>/dev/null; then
+            echo "added:$type:$package" >> "$output_file"
+        fi
+    done < "$new_parsed"
+    
+    echo "# Removed packages" >> "$output_file"
+    
+    # Find removed packages
+    while IFS=: read -r type package; do
+        if ! grep -q "^$type:$package$" "$new_parsed" 2>/dev/null; then
+            echo "removed:$type:$package" >> "$output_file"
+        fi
+    done < "$old_parsed"
+    
+    # Cleanup
+    rm -rf "$temp_dir"
+}
+
+# Function: Show changes preview to user
+show_changes_preview() {
+    local changes_file="$1"
+    local profile_name="$2"
+    
+    local has_changes=false
+    local has_installs=false
+    local has_removes=false
+    
+    echo ""
+    echo -e "${BLUE}Changes to be applied to profile '${profile_name}':${NC}"
+    echo ""
+    
+    # Check if we have any added packages
+    if grep -q "^added:" "$changes_file" 2>/dev/null; then
+        has_installs=true
+        has_changes=true
+    fi
+    
+    # Check if we have any removed packages  
+    if grep -q "^removed:" "$changes_file" 2>/dev/null; then
+        has_removes=true
+        has_changes=true
+    fi
+    
+    # Show installations
+    if [ "$has_installs" = true ]; then
+        echo -e "${GREEN}INSTALL:${NC}"
+        while IFS=: read -r action type package; do
+            if [ "$action" = "added" ]; then
+                echo -e "  ${GREEN}+${NC} $type \"$package\""
+            fi
+        done < "$changes_file"
+        echo ""
+    fi
+    
+    # Show removals
+    if [ "$has_removes" = true ]; then
+        echo -e "${RED}REMOVE:${NC}"
+        while IFS=: read -r action type package; do
+            if [ "$action" = "removed" ]; then
+                echo -e "  ${RED}-${NC} $type \"$package\""
+            fi
+        done < "$changes_file"
+        echo ""
+    fi
+    
+    if [ "$has_changes" = false ]; then
+        echo -e "${YELLOW}No changes detected.${NC}"
+        echo ""
+        return 1
+    fi
+    
+    return 0
+}
+
+# Function: Apply package changes to system
+apply_package_changes() {
+    local changes_file="$1"
+    
+    local success=true
+    
+    # Process all changes from the changes file
+    while IFS=: read -r action type package; do
+        case "$action" in
+            "added")
+                case "$type" in
+                    "brew")
+                        log_info "Installing brew package: $package"
+                        if ! brew install "$package"; then
+                            log_error "Failed to install brew package: $package"
+                            success=false
+                        fi
+                        ;;
+                    "cask")
+                        log_info "Installing cask: $package"
+                        if ! brew install --cask "$package"; then
+                            log_error "Failed to install cask: $package"
+                            success=false
+                        fi
+                        ;;
+                    "mas")
+                        log_warning "mas install not automated for: $package (please install manually from App Store)"
+                        ;;
+                esac
+                ;;
+            "removed")
+                case "$type" in
+                    "brew")
+                        log_info "Removing brew package: $package"
+                        if ! brew uninstall "$package"; then
+                            log_error "Failed to remove brew package: $package"
+                            success=false
+                        fi
+                        ;;
+                    "cask")
+                        log_info "Removing cask: $package"
+                        if ! brew uninstall --cask "$package"; then
+                            log_error "Failed to remove cask: $package"
+                            success=false
+                        fi
+                        ;;
+                    "mas")
+                        log_warning "mas uninstall not automated for: $package (please uninstall manually)"
+                        ;;
+                esac
+                ;;
+        esac
+    done < "$changes_file"
+    
+    if [ "$success" = true ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Function: Edit profile
+edit_profile() {
+    local profile_name="$1"
+    
+    # Auto-detect backup location
+    if ! detect_backup_location 2>/dev/null; then
+        log_error "Could not detect backup location. Please run backup first."
+        exit 1
+    fi
+    
+    # If no default profile is set and no profile specified, prompt for selection
+    if [ -z "$profile_name" ]; then
+        if [ -f "$DEFAULT_PROFILE_FILE" ]; then
+            profile_name=$(cat "$DEFAULT_PROFILE_FILE")
+            log_info "Using default profile: $profile_name"
+        else
+            log_info "No default profile set. Please select a profile to edit."
+            echo ""
+            profile_name=$(select_profile_for_edit "$BACKUP_DIR" "$CURRENT_HOSTNAME")
+            
+            # Set the selected profile as default
+            save_default_profile "$profile_name"
+            log_success "Set '$profile_name' as default profile"
+        fi
+    else
+        # Validate profile exists
+        if ! validate_profile_exists "$profile_name" "$BACKUP_DIR"; then
+            log_error "Profile '$profile_name' does not exist"
+            echo "Use 'brew-sync list' to see available profiles"
+            exit 1
+        fi
+    fi
+    
+    local profile_dir="$BACKUP_DIR/$PROFILES_DIR/$profile_name"
+    local brewfile_path="$profile_dir/Brewfile"
+    
+    # Create profile directory if it doesn't exist
+    if [ ! -d "$profile_dir" ]; then
+        mkdir -p "$profile_dir"
+    fi
+    
+    # Create empty Brewfile if it doesn't exist
+    if [ ! -f "$brewfile_path" ]; then
+        log_info "Creating new Brewfile for profile '$profile_name'"
+        cat > "$brewfile_path" <<EOF
+# Homebrew packages for profile: $profile_name
+# Generated on $(date)
+# 
+# Edit this file to add/remove packages:
+# - brew "package-name"        # for CLI tools
+# - cask "app-name"           # for GUI applications  
+# - mas "app-name", id: 12345 # for Mac App Store apps
+#
+# You can find package names at:
+# - https://formulae.brew.sh (for brew packages)
+# - https://github.com/Homebrew/homebrew-cask/tree/master/Casks (for cask apps)
+
+EOF
+    fi
+    
+    # Create temporary directory for editing
+    local temp_dir=$(mktemp -d)
+    local temp_brewfile="$temp_dir/Brewfile"
+    local original_brewfile="$temp_dir/Brewfile.original"
+    
+    # Copy original Brewfile to temp directory
+    if ! cp "$brewfile_path" "$temp_brewfile"; then
+        log_error "Failed to create temporary copy of Brewfile"
+        rm -rf "$temp_dir"
+        exit 1
+    fi
+    
+    # Keep a copy of the original for comparison
+    cp "$temp_brewfile" "$original_brewfile"
+    
+    # Determine editor to use
+    local editor="${EDITOR:-${VISUAL:-nano}}"
+    
+    log_info "Opening Brewfile for profile '$profile_name' with $editor"
+    echo "You will be editing a temporary copy. Changes will only be applied after confirmation."
+    echo ""
+    echo "Press any key to continue..."
+    read -r -n 1
+    
+    # Open the temporary Brewfile in the editor
+    if "$editor" "$temp_brewfile"; then
+        log_success "Brewfile edited successfully"
+        
+        # Compare changes
+        local changes_file="$temp_dir/changes.txt"
+        
+        compare_brewfiles "$original_brewfile" "$temp_brewfile" "$changes_file"
+        
+        # Show preview and get user confirmation
+        if show_changes_preview "$changes_file" "$profile_name"; then
+            echo ""
+            echo -n "Apply these changes? [y/N]: "
+            read -r response
+            
+            if [[ "$response" =~ ^[Yy] ]]; then
+                log_info "Applying changes to your system..."
+                
+                # Apply package changes
+                if apply_package_changes "$changes_file"; then
+                    log_success "Package changes applied successfully"
+                    
+                    # Copy the edited Brewfile back to profile directory
+                    if cp "$temp_brewfile" "$brewfile_path"; then
+                        log_success "Profile '$profile_name' updated with your changes"
+                        
+                        # Update backup metadata
+                        local metadata_file="$profile_dir/metadata.json"
+                        if [ -f "$metadata_file" ]; then
+                            # Update existing metadata
+                            local temp_metadata=$(mktemp)
+                            jq '.last_updated = now | .source = "edited"' "$metadata_file" > "$temp_metadata"
+                            mv "$temp_metadata" "$metadata_file"
+                        else
+                            # Create new metadata
+                            cat > "$metadata_file" <<EOF
+{
+  "profile_name": "$profile_name",
+  "created": $(date +%s),
+  "last_updated": $(date +%s),
+  "source": "edited",
+  "hostname": "$CURRENT_HOSTNAME"
+}
+EOF
+                        fi
+                        
+                        log_success "Profile '$profile_name' synchronized successfully"
+                    else
+                        log_error "Failed to save edited Brewfile to profile"
+                    fi
+                else
+                    log_error "Some package changes failed. Profile not updated."
+                fi
+            else
+                log_info "Changes discarded. Profile unchanged."
+            fi
+        else
+            log_info "No changes detected. Profile unchanged."
+        fi
+        
+        # Clean up temporary directory
+        rm -rf "$temp_dir"
+    else
+        log_error "Editor exited with error. Changes discarded."
+        rm -rf "$temp_dir"
+        exit 1
+    fi
+}
+
 # Function: Profile usage
 profile_usage() {
     echo "Usage: brew-sync profile [command] [options]"
@@ -1769,12 +2231,15 @@ profile_usage() {
     echo "  show PROFILE            Show profile details and statistics"
     echo "  set PROFILE             Set profile as default"
     echo "  get                     Get current default profile (for scripting)"
+    echo "  edit [PROFILE]          Edit profile Brewfile with default editor"
     echo "  remove PROFILE          Remove profile (except 'default')"
     echo ""
     echo "Examples:"
     echo "  brew-sync profile show work"
     echo "  brew-sync profile set work"
     echo "  brew-sync profile get"
+    echo "  brew-sync profile edit work"
+    echo "  brew-sync profile edit              # Edit default profile or select one"
     echo "  brew-sync profile remove old-profile"
     echo ""
     echo "To list/create/use profiles:"

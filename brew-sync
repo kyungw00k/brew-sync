@@ -3503,11 +3503,22 @@ check_for_updates() {
     chmod +x "$script_path" 2>/dev/null || sudo chmod +x "$script_path"
     rm -f "$temp_script" "$backup_path"
     
-    # Verify update
+    # Verify update by checking hash
     local new_hash
     new_hash=$(md5 "$script_path" 2>/dev/null | cut -d' ' -f4)
-    log_success "Updated successfully!"
-    log_info "Previous: ${current_hash:0:8}... → Current: ${new_hash:0:8}..."
+    
+    if [ "$new_hash" = "$latest_hash" ]; then
+        log_success "Updated successfully!"
+        log_info "Previous: ${current_hash:0:8}... → Current: ${new_hash:0:8}..."
+        
+        # Clean exit to prevent executing old code that may cause syntax errors
+        log_info "Update complete. Please run the command again if needed."
+        exit 0
+    else
+        log_error "Update verification failed. Hash mismatch."
+        log_error "Expected: ${latest_hash:0:8}..., Got: ${new_hash:0:8}..."
+        return 1
+    fi
 }
 
 # Function: Show version

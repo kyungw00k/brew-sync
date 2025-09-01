@@ -20,17 +20,18 @@ That's it! All your Homebrew packages, GUI apps, and Mac App Store apps are now 
 
 ## Key Features
 
-- **🚀 Smart setup**: First-time interactive setup with intelligent defaults
-- **🔄 Multi-Mac sync**: Organized by profiles for different use cases
-- **☁️ Flexible storage**: iCloud, Dropbox, Google Drive, Git, or local-only
-- **💻 Local option**: `.brew-sync` for single-Mac or privacy-conscious users
-- **📱 Complete coverage**: Homebrew + Cask apps + Mac App Store apps  
-- **🏷️ Profiles**: Different setups for work, personal, development
-- **🤖 Machine-specific defaults**: Automatically loads per-machine default profile
-- **✏️ Safe profile editing**: Edit package lists with diff preview and confirmation
-- **🔍 Preview mode**: `--dry-run` to see what will be installed
-- **⚡ Simple**: Just `backup` and `restore` - auto-detects everything
-- **🔄 Auto-migration**: Existing host-based setups automatically migrate to profiles
+- **Smart setup**: First-time interactive setup with intelligent defaults
+- **Multi-Mac sync**: Organized by profiles for different use cases  
+- **Flexible storage**: iCloud, Dropbox, Google Drive, Git, or local-only
+- **Local option**: `.brew-sync` for single-Mac or privacy-conscious users
+- **Complete coverage**: Homebrew + Cask apps + Mac App Store apps  
+- **Profiles**: Different setups for work, personal, development
+- **Machine-specific defaults**: Automatically loads per-machine default profile
+- **Safe profile editing**: Edit package lists with diff preview and confirmation
+- **Clean CLI interface**: Concise output with optional verbose mode (`--verbose`)
+- **Preview mode**: `--dry-run` to see what will be installed
+- **Simple**: Just `backup` and `restore` - auto-detects everything
+- **Auto-migration**: Existing host-based setups automatically migrate to profiles
 
 ## Installation
 
@@ -79,10 +80,12 @@ brew-sync backup
 ```bash
 # Backup packages (uses your saved preference)
 brew-sync backup
+brew-sync backup --verbose     # Show detailed progress
 
 # Restore packages (uses your saved preference)
 brew-sync restore --dry-run    # Preview first (recommended)
 brew-sync restore              # Actually install
+brew-sync restore --verbose    # Show installation details
 
 # Use profiles for different setups
 brew-sync backup --profile work
@@ -114,14 +117,13 @@ The `profile edit` feature lets you safely modify your package lists with a diff
 ```bash
 # Edit your work profile
 $ brew-sync profile edit work
-• Using default profile: work
-• Opening Brewfile for profile 'work' with nano
-You will be editing a temporary copy. Changes will only be applied after confirmation.
+Using default profile: work
+Editing profile 'work'
 
 Press any key to continue...
 
 # After editing and saving in your editor:
-✓ Brewfile edited successfully
+Brewfile edited successfully
 
 Changes to be applied to profile 'work':
 
@@ -133,21 +135,20 @@ REMOVE:
   - brew "bat"  
 
 Apply these changes? [y/N]: y
-• Applying changes to your system...
-• Installing brew package: htop
-• Installing cask: notion  
-• Removing brew package: bat
-✓ Package changes applied successfully
-✓ Profile 'work' updated with your changes
-✓ Profile 'work' synchronized successfully
+Installing brew package: htop
+Installing cask: notion  
+Removing brew package: bat
+Package changes applied successfully
+Profile 'work' updated with your changes
+Profile 'work' synchronized successfully
 ```
 
 ### Key Benefits
-- **🛡️ Safe editing**: Edit a temporary copy, not your actual profile
-- **🔍 Smart preview**: See exactly what will be installed/removed before applying
-- **✅ User control**: Confirm changes before any system modifications
-- **📦 Package-specific**: Only install/remove the exact packages you changed
-- **🎯 No surprises**: No aggressive cleanup that removes unrelated packages
+- **Safe editing**: Edit a temporary copy, not your actual profile
+- **Smart preview**: See exactly what will be installed/removed before applying
+- **User control**: Confirm changes before any system modifications
+- **Package-specific**: Only install/remove the exact packages you changed
+- **No surprises**: No aggressive cleanup that removes unrelated packages
 
 ### Usage Patterns
 ```bash
@@ -168,30 +169,31 @@ brew-sync profile edit     # Make your changes
 ```bash
 # Work MacBook: backup your development setup
 $ brew-sync backup --profile work
-• iCloud Drive detected: ~/Library/Mobile Documents/com~apple~CloudDocs/brew-backup
-• Starting Brewfile backup...
-• Host: MacBook-Pro
-• Generating current package list...
-✓ Brewfile generation completed
-• [MacBook-Pro] Backup completed!
-• Package statistics: Homebrew(47) Cask(12) MAS(8)
-✓ All operations completed!
+Backup completed (67 packages)
+
+# With verbose output:
+$ brew-sync backup --profile work --verbose
+Starting backup for profile 'work' on host 'MacBook-Pro'  
+Generating current package list...
+Package list generated successfully
+Backup completed (67 packages)
+Location: ~/Library/Mobile Documents/com~apple~CloudDocs/brew-backup/profiles/work/Brewfile
+Packages: 47 brew, 12 cask, 8 MAS apps
 
 # Home iMac: restore the same setup  
-$ brew-sync restore --profile work
-• iCloud Drive detected: ~/Library/Mobile Documents/com~apple~CloudDocs/brew-backup
-→ Restore source: Profile 'work'
-• Package information to restore:
-•   - Homebrew packages: 47
-•   - Cask apps: 12
-•   - Mac App Store apps: 8
+$ brew-sync restore --profile work --dry-run
+[DRY-RUN] All packages are already installed
 
-✓ Copied Brewfile to current directory
-→ Starting package installation...
-• Running brew bundle...
+$ brew-sync restore --profile work
+Restore completed successfully!
+
+# With verbose output:
+$ brew-sync restore --profile work --verbose  
+Starting package installation from /tmp/Brewfile.temp
+Executing: brew bundle --file="/tmp/Brewfile.temp" --no-upgrade
 Using node, python, docker, git, vscode, slack, cursor...
 `brew bundle` complete! 67 Brewfile dependencies now installed.
-✓ All packages installed successfully!
+Restore completed successfully!
 ```
 
 ## Common Options
@@ -227,6 +229,18 @@ brew-sync restore --git --profile dev     # From Git, dev profile
 # Preview and change defaults
 brew-sync restore --dry-run         # Preview only (recommended)
 brew-sync restore --select-storage  # Choose storage and restore
+```
+
+### Verbose Output
+```bash
+# Show detailed progress information
+brew-sync backup --verbose          # Detailed backup process  
+brew-sync restore --verbose         # Detailed installation process
+brew-sync profile edit --verbose    # Detailed editing process
+
+# Combine with other options
+brew-sync backup --profile work --verbose
+brew-sync restore --dry-run --verbose
 ```
 
 ### Update Options

@@ -27,6 +27,7 @@ That's it! All your Homebrew packages, GUI apps, and Mac App Store apps are now 
 - **📱 Complete coverage**: Homebrew + Cask apps + Mac App Store apps  
 - **🏷️ Profiles**: Different setups for work, personal, development
 - **🤖 Machine-specific defaults**: Automatically loads per-machine default profile
+- **✏️ Safe profile editing**: Edit package lists with diff preview and confirmation
 - **🔍 Preview mode**: `--dry-run` to see what will be installed
 - **⚡ Simple**: Just `backup` and `restore` - auto-detects everything
 - **🔄 Auto-migration**: Existing host-based setups automatically migrate to profiles
@@ -94,6 +95,8 @@ brew-sync restore                 # Uses machine-specific default profile
 # Profile management commands
 brew-sync profile list            # List all profiles
 brew-sync profile show work       # Show details of work profile
+brew-sync profile edit work       # Edit work profile packages safely
+brew-sync profile edit            # Edit default profile or select one
 brew-sync profile remove old      # Remove old profile (except 'default')
 
 # Utility commands
@@ -102,6 +105,62 @@ brew-sync update               # Update to latest version
 brew-sync update --check       # Check for updates only
 brew-sync uninstall            # Uninstall brew-sync
 brew-sync help                 # Get help
+```
+
+## Profile Editing
+
+The `profile edit` feature lets you safely modify your package lists with a diff-based approach:
+
+```bash
+# Edit your work profile
+$ brew-sync profile edit work
+• Using default profile: work
+• Opening Brewfile for profile 'work' with nano
+You will be editing a temporary copy. Changes will only be applied after confirmation.
+
+Press any key to continue...
+
+# After editing and saving in your editor:
+✓ Brewfile edited successfully
+
+Changes to be applied to profile 'work':
+
+INSTALL:
+  + brew "htop"
+  + cask "notion"
+
+REMOVE:
+  - brew "bat"  
+
+Apply these changes? [y/N]: y
+• Applying changes to your system...
+• Installing brew package: htop
+• Installing cask: notion  
+• Removing brew package: bat
+✓ Package changes applied successfully
+✓ Profile 'work' updated with your changes
+✓ Profile 'work' synchronized successfully
+```
+
+### Key Benefits
+- **🛡️ Safe editing**: Edit a temporary copy, not your actual profile
+- **🔍 Smart preview**: See exactly what will be installed/removed before applying
+- **✅ User control**: Confirm changes before any system modifications
+- **📦 Package-specific**: Only install/remove the exact packages you changed
+- **🎯 No surprises**: No aggressive cleanup that removes unrelated packages
+
+### Usage Patterns
+```bash
+# Edit specific profile
+brew-sync profile edit work
+
+# Edit default profile (or select if none set)
+brew-sync profile edit
+
+# Typical workflow
+brew-sync profile edit     # Make your changes
+# Review the preview carefully
+# Type 'y' to apply or 'N' to cancel
 ```
 
 ## Real-world example

@@ -28,8 +28,11 @@ That's it! All your Homebrew packages, GUI apps, and Mac App Store apps are now 
 - **Profiles**: Different setups for work, personal, development
 - **Machine-specific defaults**: Automatically loads per-machine default profile
 - **Safe profile editing**: Edit package lists with diff preview and confirmation
+- **Backup history**: View and rollback to previous backup versions
+- **Interactive rollback**: Select from backup history with simple numbered menu
 - **Clean CLI interface**: Concise output with optional verbose mode (`--verbose`)
-- **Preview mode**: `--dry-run` to see what will be installed
+- **Preview mode**: `--dry-run` to see what will be installed/restored
+- **History management**: Automatic cleanup of old backups with configurable retention
 - **Simple**: Just `backup` and `restore` - auto-detects everything
 - **Auto-migration**: Existing host-based setups automatically migrate to profiles
 
@@ -88,22 +91,24 @@ brew-sync restore              # Actually install
 brew-sync restore --verbose    # Show installation details
 
 # Use profiles for different setups
-brew-sync backup --profile work
-brew-sync restore --profile work
+brew-sync backup work
+brew-sync restore work
 
 # Machine-specific default profile (automatically loaded from ~/.config/brew-sync/default_profile)
 brew-sync backup                  # Uses machine-specific default profile
 brew-sync restore                 # Uses machine-specific default profile
 
 # Profile management commands
-brew-sync profile list            # List all profiles
-brew-sync profile show work       # Show details of work profile
-brew-sync profile edit work       # Edit work profile packages safely
-brew-sync profile edit            # Edit default profile or select one
-brew-sync profile remove old      # Remove old profile (except 'default')
+brew-sync status                   # List all profiles
+brew-sync status work              # Show details of work profile
+brew-sync edit work                # Edit work profile packages safely
+brew-sync edit                     # Edit default profile or select one
+brew-sync set work                 # Set work as default profile
+brew-sync remove old               # Remove old profile (except 'default')
 
-# Utility commands
-brew-sync list                 # List available backups
+# History commands
+brew-sync history work             # Show backup history for profile
+brew-sync rollback work            # Interactive rollback to previous backup
 brew-sync update               # Update to latest version
 brew-sync update --check       # Check for updates only
 brew-sync uninstall            # Uninstall brew-sync
@@ -116,7 +121,7 @@ The `profile edit` feature lets you safely modify your package lists with a diff
 
 ```bash
 # Edit your work profile
-$ brew-sync profile edit work
+$ brew-sync edit work
 Using default profile: work
 Editing profile 'work'
 
@@ -153,26 +158,73 @@ Profile 'work' synchronized successfully
 ### Usage Patterns
 ```bash
 # Edit specific profile
-brew-sync profile edit work
+brew-sync edit work
 
 # Edit default profile (or select if none set)
-brew-sync profile edit
+brew-sync edit
 
 # Typical workflow
-brew-sync profile edit     # Make your changes
+brew-sync edit work        # Make your changes
 # Review the preview carefully
 # Type 'y' to apply or 'N' to cancel
 ```
+
+## Backup History & Recovery
+
+brew-sync automatically maintains a complete history of your backups, making it easy to recover from mistakes or revert to previous configurations.
+
+### View Backup History
+```bash
+# Show all backups for work profile
+brew-sync history work
+
+# Output:
+# Backup history for 'work':
+# [1] 2h ago (103 packages)
+# [2] 2d ago (101 packages)  
+# [3] 1w ago (98 packages)
+```
+
+### Rollback to Previous Backup
+```bash
+# Interactive rollback - shows menu to select
+brew-sync rollback work
+# Select backup [1-3]: 2
+
+# Direct rollback to specific backup
+brew-sync rollback work 2
+
+# Preview rollback without making changes
+brew-sync rollback work 2 --dry-run
+```
+
+### Backup Management
+```bash
+# Preview backup changes
+brew-sync backup work --dry-run
+
+# Clean up old backups (keep only 5 most recent per profile)
+brew-sync cleanup --keep-history 5
+
+# Preview cleanup actions
+brew-sync cleanup --keep-history 3 --dry-run
+```
+
+### Safety Features
+- **Automatic backup**: Current state is automatically backed up before any rollback
+- **User confirmation**: Always prompts before making changes
+- **Preview mode**: `--dry-run` shows exactly what will happen
+- **Smart retention**: Configurable history cleanup prevents unlimited storage growth
 
 ## Real-world example
 
 ```bash
 # Work MacBook: backup your development setup
-$ brew-sync backup --profile work
+$ brew-sync backup work
 Backup completed (67 packages)
 
 # With verbose output:
-$ brew-sync backup --profile work --verbose
+$ brew-sync backup work --verbose
 Starting backup for profile 'work' on host 'MacBook-Pro'  
 Generating current package list...
 Package list generated successfully
@@ -181,14 +233,14 @@ Location: ~/Library/Mobile Documents/com~apple~CloudDocs/brew-backup/profiles/wo
 Packages: 47 brew, 12 cask, 8 MAS apps
 
 # Home iMac: restore the same setup  
-$ brew-sync restore --profile work --dry-run
+$ brew-sync restore work --dry-run
 [DRY-RUN] All packages are already installed
 
-$ brew-sync restore --profile work
+$ brew-sync restore work
 Restore completed successfully!
 
 # With verbose output:
-$ brew-sync restore --profile work --verbose  
+$ brew-sync restore work --verbose  
 Starting package installation from /tmp/Brewfile.temp
 Executing: brew bundle --file="/tmp/Brewfile.temp" --no-upgrade
 Using node, python, docker, git, vscode, slack, cursor...
@@ -219,12 +271,12 @@ brew-sync backup --select-storage   # Interactive selection (saves new default)
 ```bash
 # What to restore
 brew-sync restore                   # Default profile backup (loads machine-specific default)
-brew-sync restore --profile work    # Work profile backup
-brew-sync restore --profile dev     # Development profile backup
+brew-sync restore work    # Work profile backup
+brew-sync restore dev     # Development profile backup
 
 # Where to restore from (temporary overrides)
-brew-sync restore --icloud --profile work # From iCloud, work profile
-brew-sync restore --git --profile dev     # From Git, dev profile
+brew-sync restore work --icloud # From iCloud, work profile
+brew-sync restore dev --git     # From Git, dev profile
 
 # Preview and change defaults
 brew-sync restore --dry-run         # Preview only (recommended)
@@ -236,10 +288,10 @@ brew-sync restore --select-storage  # Choose storage and restore
 # Show detailed progress information
 brew-sync backup --verbose          # Detailed backup process  
 brew-sync restore --verbose         # Detailed installation process
-brew-sync profile edit --verbose    # Detailed editing process
+brew-sync edit work --verbose    # Detailed editing process
 
 # Combine with other options
-brew-sync backup --profile work --verbose
+brew-sync backup work --verbose
 brew-sync restore --dry-run --verbose
 ```
 

@@ -85,6 +85,202 @@ log_restore() {
     log_info "$1"
 }
 
+log_status() {
+    echo -e "${BLUE}$1${NC}"
+}
+
+# Helper: Format profile summary for status command (concise)
+format_profile_summary() {
+    local profile_name="$1"
+    local profile_dir="$2"
+    local metadata_file="$profile_dir/metadata.json"
+    
+    if [ ! -f "$metadata_file" ]; then
+        echo "$profile_name    (no metadata)"
+        return
+    fi
+    
+    # Extract info from metadata
+    local last_backup hostname brew_count cask_count mas_count
+    last_backup=$(jq -r '.last_backup // "unknown"' "$metadata_file" 2>/dev/null)
+    hostname=$(jq -r '.hostname // "unknown"' "$metadata_file" 2>/dev/null)
+    brew_count=$(jq -r '.package_count.brew // 0' "$metadata_file" 2>/dev/null)
+    cask_count=$(jq -r '.package_count.cask // 0' "$metadata_file" 2>/dev/null)
+    mas_count=$(jq -r '.package_count.mas // 0' "$metadata_file" 2>/dev/null)
+    
+    # Format date (convert ISO to short format)
+    local formatted_date
+    if [[ "$last_backup" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2} ]]; then
+        formatted_date=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$last_backup" "+%b %d %H:%M" 2>/dev/null || echo "$last_backup")
+    else
+        formatted_date="$last_backup"
+    fi
+    
+    printf "%-12s %12s    brew(%s) cask(%s) mas(%s)\n" "$profile_name" "$formatted_date" "$brew_count" "$cask_count" "$mas_count"
+}
+
+# Helper: Format profile details for status command (concise)
+format_profile_detail() {
+    local profile_name="$1"
+    local profile_dir="$2"
+    local metadata_file="$profile_dir/metadata.json"
+    
+    if [ ! -f "$metadata_file" ]; then
+        echo "Profile: $profile_name"
+        echo "No metadata available"
+        return
+    fi
+    
+    # Extract info from metadata
+    local last_backup hostname brew_count cask_count mas_count total_count
+    last_backup=$(jq -r '.last_backup // "unknown"' "$metadata_file" 2>/dev/null)
+    hostname=$(jq -r '.hostname // "unknown"' "$metadata_file" 2>/dev/null)
+    brew_count=$(jq -r '.package_count.brew // 0' "$metadata_file" 2>/dev/null)
+    cask_count=$(jq -r '.package_count.cask // 0' "$metadata_file" 2>/dev/null)
+    mas_count=$(jq -r '.package_count.mas // 0' "$metadata_file" 2>/dev/null)
+    total_count=$((brew_count + cask_count + mas_count))
+    
+    # Format date
+    local formatted_date
+    if [[ "$last_backup" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2} ]]; then
+        formatted_date=$(date -j -f "%Y-%m-%dT%H:%M:%S%z" "$last_backup" "+%b %d %H:%M" 2>/dev/null || echo "$last_backup")
+    else
+        formatted_date="$last_backup"
+    fi
+    
+    echo "Profile: $profile_name"
+    echo "Last backup: $formatted_date ($hostname)"
+    echo "Packages: $brew_count brew, $cask_count cask, $mas_count mas ($total_count total)"
+}
+
+# History management functions
+
+# Function: Get backup history for a profile
+get_backup_history() {
+    local profile="$1"
+    local backup_dir="$2"
+    local profile_dir="$backup_dir/profiles/$profile"
+    
+    if [ ! -d "$profile_dir" ]; then
+        return 1
+    fi
+    
+    # Find all backup files with timestamp pattern
+    find "$profile_dir" -name "Brewfile_[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]_[0-9][0-9][0-9][0-9][0-9][0-9]*" -type f | sort -r
+}
+
+# Function: Parse backup file info
+parse_backup_info() {
+    local backup_file="$1"
+    local filename=$(basename "$backup_file")
+    
+    # Extract timestamp from filename (Brewfile_YYYYMMDD_HHMMSS format)
+    local timestamp=$(echo "$filename" | sed 's/Brewfile_\([0-9]\{8\}_[0-9]\{6\}\).*/\1/')
+    
+    if [ -n "$timestamp" ]; then
+        # Convert timestamp to readable format
+        local date_part="${timestamp%_*}"
+        local time_part="${timestamp#*_}"
+        local formatted_date="${date_part:0:4}-${date_part:4:2}-${date_part:6:2}"
+        local formatted_time="${time_part:0:2}:${time_part:2:2}:${time_part:4:2}"
+        
+        # Count packages in backup file
+        local brew_count=0
+        local cask_count=0
+        local mas_count=0
+        
+        if [ -f "$backup_file" ]; then
+            if [[ "$backup_file" == *.gz ]]; then
+                brew_count=$(zcat "$backup_file" 2>/dev/null | grep -c "^brew " 2>/dev/null)
+                cask_count=$(zcat "$backup_file" 2>/dev/null | grep -c "^cask " 2>/dev/null)
+                mas_count=$(zcat "$backup_file" 2>/dev/null | grep -c "^mas " 2>/dev/null)
+            else
+                brew_count=$(grep -c "^brew " "$backup_file" 2>/dev/null)
+                cask_count=$(grep -c "^cask " "$backup_file" 2>/dev/null)
+                mas_count=$(grep -c "^mas " "$backup_file" 2>/dev/null)
+            fi
+            
+            # Clean and validate counts
+            brew_count=$(echo "$brew_count" | tr -d '\n\r' | grep -E '^[0-9]+$' || echo "0")
+            cask_count=$(echo "$cask_count" | tr -d '\n\r' | grep -E '^[0-9]+$' || echo "0")
+            mas_count=$(echo "$mas_count" | tr -d '\n\r' | grep -E '^[0-9]+$' || echo "0")
+        fi
+        
+        local total_count=$((brew_count + cask_count + mas_count))
+        
+        echo "$formatted_date $formatted_time|$total_count|$backup_file"
+    fi
+}
+
+# Function: Format relative time
+format_relative_time() {
+    local backup_date="$1"
+    local now=$(date +%s)
+    local backup_timestamp=$(date -j -f "%Y-%m-%d %H:%M:%S" "$backup_date" +%s 2>/dev/null)
+    
+    if [ -n "$backup_timestamp" ]; then
+        local diff=$((now - backup_timestamp))
+        local days=$((diff / 86400))
+        local hours=$(((diff % 86400) / 3600))
+        
+        if [ $days -gt 0 ]; then
+            echo "${days}d ago"
+        elif [ $hours -gt 0 ]; then
+            echo "${hours}h ago"
+        else
+            echo "now"
+        fi
+    else
+        echo "$backup_date"
+    fi
+}
+
+# JSON parsing functions (bash fallback for jq)
+
+# Function: Parse JSON field value using bash
+parse_json_field() {
+    local json_file="$1"
+    local field_path="$2"
+    
+    if [ ! -f "$json_file" ]; then
+        return 1
+    fi
+    
+    case "$field_path" in
+        "hostname"|"profile"|"user"|"last_backup"|"macos_version"|"homebrew_version")
+            # Simple string fields: "field": "value"
+            grep "\"$field_path\":" "$json_file" | sed 's/.*: *"\([^"]*\)".*/\1/' | head -1
+            ;;
+        "package_count.brew"|"package_count.cask"|"package_count.mas")
+            # Nested numeric fields: "field": number
+            local pkg_type="${field_path##*.}"  # Extract part after last dot
+            grep "\"$pkg_type\":" "$json_file" | sed 's/.*: *\([0-9]*\).*/\1/' | head -1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# Function: Get metadata field with jq fallback
+get_metadata_field() {
+    local json_file="$1"
+    local field="$2"
+    local default_value="${3:-}"
+    
+    if command -v jq >/dev/null 2>&1; then
+        jq -r ".$field // \"$default_value\"" "$json_file" 2>/dev/null
+    else
+        local result
+        result=$(parse_json_field "$json_file" "$field")
+        if [ -n "$result" ]; then
+            echo "$result"
+        else
+            echo "$default_value"
+        fi
+    fi
+}
+
 # Migration functions
 
 # Function: Check if migration is needed from hosts to profiles
@@ -203,21 +399,19 @@ recommend_profile() {
                 
                 # Check metadata for hostname match
                 if [ -f "$profile_dir/metadata.json" ]; then
-                    if command -v jq >/dev/null 2>&1; then
-                        local hostname_from_meta
-                        hostname_from_meta=$(jq -r '.hostname // empty' "$profile_dir/metadata.json" 2>/dev/null)
-                        if [ -n "$hostname_from_meta" ] && [ "$hostname_from_meta" = "$current_hostname" ]; then
-                            echo "$profile_name"
-                            return 0
-                        fi
-                        
-                        # Also check created_from_host field (from migration)
-                        local created_from_host
-                        created_from_host=$(jq -r '.created_from_host // empty' "$profile_dir/metadata.json" 2>/dev/null)
-                        if [ -n "$created_from_host" ] && [ "$created_from_host" = "$current_hostname" ]; then
-                            echo "$profile_name"
-                            return 0
-                        fi
+                    local hostname_from_meta
+                    hostname_from_meta=$(get_metadata_field "$profile_dir/metadata.json" "hostname" "")
+                    if [ -n "$hostname_from_meta" ] && [ "$hostname_from_meta" = "$current_hostname" ]; then
+                        echo "$profile_name"
+                        return 0
+                    fi
+                    
+                    # Also check created_from_host field (from migration)
+                    local created_from_host
+                    created_from_host=$(get_metadata_field "$profile_dir/metadata.json" "created_from_host" "")
+                    if [ -n "$created_from_host" ] && [ "$created_from_host" = "$current_hostname" ]; then
+                        echo "$profile_name"
+                        return 0
                     fi
                 fi
             fi
@@ -883,8 +1077,8 @@ first_time_setup() {
         case "$method" in
             icloud)
                 echo "  $i) $display_name (recommended for multiple Macs)" >&2
-                echo "     📱 Syncs automatically across your Macs" >&2
-                echo "     📂 $path" >&2
+                echo "     Syncs automatically across your Macs" >&2
+                echo "     Path: $path" >&2
                 if [[ "$OSTYPE" == "darwin"* ]]; then
                     recommended_index=$i
                 fi
@@ -892,7 +1086,7 @@ first_time_setup() {
             local)
                 echo "  $i) $display_name" >&2
                 echo "     💻 Stays on this Mac only" >&2
-                echo "     📂 $path" >&2
+                echo "     Path: $path" >&2
                 if [[ "$OSTYPE" != "darwin"* ]]; then
                     recommended_index=$i
                 fi
@@ -900,12 +1094,12 @@ first_time_setup() {
             git)
                 echo "  $i) $display_name" >&2
                 echo "     🔄 Version control and manual sync" >&2
-                echo "     📂 $path" >&2
+                echo "     Path: $path" >&2
                 ;;
             *)
                 echo "  $i) $display_name" >&2
                 echo "     ☁️  Cloud storage service" >&2
-                echo "     📂 $path" >&2
+                echo "     Path: $path" >&2
                 ;;
         esac
         echo "" >&2
@@ -1167,66 +1361,48 @@ usage() {
     echo "brew-sync: Homebrew package synchronization tool"
     echo ""
     echo "Usage:"
-    echo "  brew-sync backup [options]    # Backup current packages"
-    echo "  brew-sync restore [options]   # Restore packages from backup"
-    echo "  brew-sync list                # List available backups"
-    echo "  brew-sync profile [command]   # Manage profile aliases"
+    echo "  brew-sync backup [profile]    # Backup current packages"
+    echo "  brew-sync restore [profile]   # Restore packages from backup"
+    echo "  brew-sync status [profile]    # Show backup status"
+    echo "  brew-sync history <profile>   # Show backup history"
+    echo "  brew-sync rollback <profile>  # Rollback to previous backup"
+    echo "  brew-sync edit [profile]      # Edit profile Brewfile"
+    echo "  brew-sync set <profile>       # Set default profile"
+    echo "  brew-sync remove <profile>    # Remove profile"
     echo "  brew-sync cleanup [options]   # Clean up old backup files"
     echo "  brew-sync update              # Update to latest version"
     echo "  brew-sync uninstall           # Uninstall brew-sync"
     echo "  brew-sync help                # Show this help"
     echo ""
-    echo "Backup examples:"
-    echo "  brew-sync backup                           # Backup to default profile"
-    echo "  brew-sync backup --profile work            # Backup to work profile"
-    echo "  brew-sync backup --git                     # Backup to Git repository"
-    echo "  brew-sync backup --dropbox --profile dev   # Backup to Dropbox with dev profile"
-    echo ""
-    echo "Restore examples:"
-    echo "  brew-sync restore                          # Restore from default profile"
-    echo "  brew-sync restore --profile work           # Restore from work profile"
-    echo "  brew-sync restore --dry-run                # Preview only"
-    echo "  brew-sync restore --profile dev --dry-run  # Preview dev profile restore"
-    echo ""
-    echo "Profile examples:"
-    echo "  brew-sync backup --profile work            # Create work profile"
-    echo "  brew-sync restore --profile work           # Use work profile"
-    echo "  brew-sync profile set work                 # Set work as default profile"
-    echo "  brew-sync profile get                      # Show current default profile"
-    echo ""
-    echo "Cleanup examples:"
-    echo "  brew-sync cleanup                          # Remove duplicates and compress old backups"
-    echo "  brew-sync cleanup --dry-run                # Preview cleanup actions"
-    echo "  brew-sync cleanup --all                    # Full cleanup with archiving"
-    echo ""
-    echo "For detailed options, add --help to each command:"
-    echo "  brew-sync backup --help"
-    echo "  brew-sync restore --help"
-    echo "  brew-sync profile --help"
-    echo "  brew-sync cleanup --help"
-    echo "  brew-sync update --help"
-    echo ""
-    echo "Note: Use --select-storage to change your default storage location."
+    echo "Examples:"
+    echo "  brew-sync backup work         # Backup work profile"
+    echo "  brew-sync restore --dry-run   # Preview restore"
+    echo "  brew-sync status              # Show all profiles"
+    echo "  brew-sync edit work           # Edit work profile"
+    echo "  brew-sync set work            # Set work as default"
 }
 
 # Function: Print backup usage
 backup_usage() {
-    echo "Usage: brew-sync backup [options]"
+    echo "Usage: brew-sync backup [profile] [options]"
+    echo ""
+    echo "Arguments:"
+    echo "  profile              Profile name (optional, defaults to current default)"
     echo ""
     echo "Common options:"
-    echo "  -p, --profile NAME   Use profile (e.g., dev, design)"
     echo "  -v, --verbose        Show detailed progress information"
+    echo "  -d, --dry-run        Preview backup without making changes"
     echo "  --select-storage     Choose storage location interactively (**saves as default**)"
     echo "  --git                Backup to Git repository (temporary)"
     echo "  --icloud             Backup to iCloud Drive (temporary)"
     echo "  --dropbox            Backup to Dropbox (temporary)"
-    echo "  --path PATH          Backup to custom path (temporary)"
+    echo "  --path <path>        Backup to custom path (temporary)"
     echo ""
     echo "Examples:"
-    echo "  brew-sync backup                    # Auto-detect best location"
-    echo "  brew-sync backup --git              # Use Git repository once"
-    echo "  brew-sync backup --select-storage   # Choose and save as default"
-    echo "  brew-sync backup -p dev             # Backup dev profile"
+    echo "  brew-sync backup                    # Backup to default profile"
+    echo "  brew-sync backup work               # Backup to work profile"
+    echo "  brew-sync backup --dry-run          # Preview backup changes"
+    echo "  brew-sync backup dev --verbose      # Backup dev profile with details"
     echo ""
     echo "Note: Only --select-storage changes your default storage location."
     echo "      The default profile is loaded from ~/.config/brew-sync/default_profile if it exists."
@@ -1235,7 +1411,10 @@ backup_usage() {
 
 # Function: Print backup usage (full)
 backup_usage_full() {
-    echo "Usage: brew-sync backup [options]"
+    echo "Usage: brew-sync backup [profile] [options]"
+    echo ""
+    echo "Arguments:"
+    echo "  profile              Profile name (optional, defaults to current default)"
     echo ""
     echo "Backup location options:"
     if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -1246,12 +1425,10 @@ backup_usage_full() {
     echo "  --git                Backup to Git repository"
     echo "  --dropbox            Backup to Dropbox folder"
     echo "  --google-drive       Backup to Google Drive folder"
-    echo "  --path PATH          Custom path"
-    echo "  --usb VOLUME         Backup to USB drive (e.g., MyUSB)"
+    echo "  --path <path>        Custom path"
+    echo "  --usb <volume>       Backup to USB drive (e.g., MyUSB)"
     echo ""
     echo "Backup options:"
-    echo "  -p, --profile NAME   Specify profile name (e.g., dev, design)"
-    echo "  --no-merge          Disable merge functionality"
     echo "  --select-storage    **Interactively choose storage location (saves as new default)**"
     echo "  --auto-detect       Auto-detect optimal backup location (default)"
     echo "  -h, --help          Show this help"
@@ -1269,11 +1446,10 @@ backup_usage_full() {
 
 # Function: Print restore usage
 restore_usage() {
-    echo "Usage: brew-sync restore [options]"
+    echo "Usage: brew-sync restore [profile] [options]"
     echo ""
-    echo "What to restore:"
-    echo "  (default)            Default profile"
-    echo "  -p, --profile NAME   Specific profile (work, dev, etc.)"
+    echo "Arguments:"
+    echo "  profile              Profile to restore (optional, defaults to current default)"
     echo ""
     echo "Where to restore from:"
     echo "  (default)            Last used storage location"
@@ -1289,8 +1465,8 @@ restore_usage() {
     echo "Examples:"
     echo "  brew-sync restore --dry-run         # Preview default profile"
     echo "  brew-sync restore                   # Restore default profile"
-    echo "  brew-sync restore --profile work    # Restore work profile"
-    echo "  brew-sync restore -p dev --dry-run  # Preview dev profile"
+    echo "  brew-sync restore work              # Restore work profile"
+    echo "  brew-sync restore dev --dry-run     # Preview dev profile"
     echo ""
     echo "Note: Only --select-storage changes your default storage location."
     echo "      The default profile is loaded from ~/.config/brew-sync/default_profile if it exists."
@@ -1299,21 +1475,17 @@ restore_usage() {
 
 # Function: Print restore usage (full)
 restore_usage_full() {
-    echo "Usage: brew-sync restore [options]"
+    echo "Usage: brew-sync restore [profile] [options]"
     echo ""
     echo "Backup source options:"
     echo "  --icloud               Restore from iCloud Drive"
     echo "  --git                  Restore from Git repository"
     echo "  --dropbox              Restore from Dropbox"
     echo "  --google-drive         Restore from Google Drive"
-    echo "  --path PATH            Restore from custom path"
-    echo "  --usb VOLUME           Restore from USB drive"
+    echo "  --path <path>          Restore from custom path"
+    echo "  --usb <volume>         Restore from USB drive"
     echo "  --select-storage       **Interactively choose storage location (saves as new default)**"
     echo "  --auto-detect          Auto-detect optimal backup location (default)"
-    echo ""
-    echo "Profile options:"
-    echo "  -p, --profile NAME     Use specific profile (work, dev, etc.)"
-    echo "  (default: default profile)"
     echo ""
     echo "Installation options:"
     echo "  -d, --dry-run          Preview only without actual installation"
@@ -1328,9 +1500,9 @@ restore_usage_full() {
     echo ""
     echo "Examples:"
     echo "  brew-sync restore                     # Auto-detect and restore default profile"
-    echo "  brew-sync restore --git --profile work   # Restore work profile from Git repository"
-    echo "  brew-sync restore --dropbox --profile dev # Restore dev profile from Dropbox"
-    echo "  brew-sync restore --path ~/backup --profile work  # Restore work profile from custom path"
+    echo "  brew-sync restore work --git         # Restore work profile from Git repository"
+    echo "  brew-sync restore dev --dropbox     # Restore dev profile from Dropbox"
+    echo "  brew-sync restore work --path ~/backup  # Restore work profile from custom path"
 }
 
 # Function: Auto-detect backup location with smart selection
@@ -1669,62 +1841,24 @@ manage_profiles() {
                 echo "Current default profile: $(cat "$DEFAULT_PROFILE_FILE")"
             else
                 echo "No default profile set"
-                echo "Use 'brew-sync profile set PROFILE' to set a default profile"
+                echo "Use 'brew-sync set PROFILE' to set a default profile"
             fi
             echo ""
-            echo "Available commands: set, show, remove, edit"
-            echo "Use 'brew-sync profile --help' for detailed usage"
-            ;;
-        set)
-            local profile_name="$1"
-            if [ -z "$profile_name" ]; then
-                log_error "Profile name is required"
-                echo "Usage: brew-sync profile set PROFILE"
-                exit 1
-            fi
-            
-            # Auto-detect backup location
-            if ! detect_backup_location 2>/dev/null; then
-                log_error "Could not detect backup location. Please run backup first."
-                exit 1
-            fi
-            
-            # Validate profile exists
-            if ! validate_profile_exists "$profile_name" "$BACKUP_DIR"; then
-                log_error "Profile '$profile_name' does not exist"
-                echo "Use 'brew-sync list' to see available profiles"
-                exit 1
-            fi
-            
-            # Save as default profile
-            save_default_profile "$profile_name"
-            log_success "Default profile set to: $profile_name"
-            ;;
-        get)
-            if default_profile=$(load_default_profile 2>/dev/null); then
-                echo "Current default profile: $default_profile"
-            else
-                echo "No default profile set"
-                echo "Use 'brew-sync profile set PROFILE' to set a default profile"
-            fi
-            ;;
-        remove|rm)
-            remove_profile "$@"
-            ;;
-        show)
-            show_profile "$@"
-            ;;
-        edit)
-            edit_profile "$@"
+            echo "Profile management commands have moved to top level:"
+            echo "  brew-sync edit [profile]     # Edit profile"
+            echo "  brew-sync set <profile>      # Set default profile"
+            echo "  brew-sync remove <profile>   # Remove profile"
+            echo "  brew-sync status [profile]   # View profile status"
             ;;
         help|--help|-h)
             profile_usage
             ;;
         *)
-            echo "Current default profile: $(load_default_profile 2>/dev/null || echo 'none')"
-            echo ""
-            echo "Available commands: set, show, remove, edit"
-            echo "Use 'brew-sync profile --help' for detailed usage"
+            echo "Profile management commands have moved to top level:"
+            echo "  brew-sync edit [profile]     # Edit profile"
+            echo "  brew-sync set <profile>      # Set default profile"  
+            echo "  brew-sync remove <profile>   # Remove profile"
+            echo "  brew-sync status [profile]   # View profile status"
             echo ""
             log_error "Unknown profile command: $command"
             exit 1
@@ -1778,24 +1912,68 @@ list_profiles() {
 
 # Function: Set profile (legacy compatibility message)
 set_profile() {
-    log_error "Profile aliases are no longer supported."
-    echo ""
-    echo "The new profile system uses actual directories instead of aliases."
-    echo "To work with profiles:"
-    echo "  • backup:  brew-sync backup --profile PROFILE_NAME"
-    echo "  • restore: brew-sync restore --profile PROFILE_NAME"
-    echo "  • list:    brew-sync list"
-    echo "  • show:    brew-sync profile show PROFILE_NAME"
-    exit 1
+    local profile_name="$1"
+    
+    # Handle help
+    if [[ "$1" == "--help" || "$1" == "-h" || -z "$1" ]]; then
+        echo "Usage: brew-sync set <profile>"
+        echo ""
+        echo "Set profile as default"
+        echo ""
+        echo "Arguments:"
+        echo "  profile              Profile name to set as default (required)"
+        echo ""
+        echo "Examples:"
+        echo "  brew-sync set work           # Set work as default profile"
+        echo "  brew-sync set default        # Set default as default profile"
+        exit 0
+    fi
+    
+    # Validate profile name
+    if ! validate_profile_name "$profile_name"; then
+        log_error "Invalid profile name: '$profile_name'"
+        log_info "Profile names must be alphanumeric with hyphens/underscores only (max 50 chars)"
+        exit 1
+    fi
+    
+    # Auto-detect backup location
+    if ! detect_backup_location 2>/dev/null; then
+        BACKUP_DIR="$DEFAULT_BACKUP_DIR"
+    fi
+    
+    # Check if profile exists
+    local profile_dir="$BACKUP_DIR/profiles/$profile_name"
+    if [ ! -d "$profile_dir" ] || [ ! -f "$profile_dir/Brewfile" ]; then
+        log_error "Profile '$profile_name' does not exist"
+        echo "Use 'brew-sync status' to see available profiles"
+        echo "Use 'brew-sync backup $profile_name' to create it"
+        exit 1
+    fi
+    
+    # Save as default profile
+    save_default_profile "$profile_name"
+    log_success "Set '$profile_name' as default profile"
 }
 
 # Function: Remove profile
 remove_profile() {
     local profile_name="$1"
     
-    if [ -z "$profile_name" ]; then
-        log_error "Usage: brew-sync profile remove PROFILE_NAME"
-        exit 1
+    # Handle help
+    if [[ "$1" == "--help" || "$1" == "-h" || -z "$1" ]]; then
+        echo "Usage: brew-sync remove <profile>"
+        echo ""
+        echo "Remove profile (except 'default')"
+        echo ""
+        echo "Arguments:"
+        echo "  profile              Profile name to remove (required)"
+        echo ""
+        echo "Examples:"
+        echo "  brew-sync remove work        # Remove work profile"
+        echo "  brew-sync remove old         # Remove old profile"
+        echo ""
+        echo "Note: Cannot remove the 'default' profile"
+        exit 0
     fi
     
     if [ "$profile_name" = "$DEFAULT_PROFILE" ]; then
@@ -1828,85 +2006,6 @@ remove_profile() {
     fi
 }
 
-# Function: Show profile
-show_profile() {
-    local profile_name="$1"
-    local using_default=false
-    
-    # If no profile specified, use default profile
-    if [ -z "$profile_name" ]; then
-        if [ -f "$DEFAULT_PROFILE_FILE" ]; then
-            profile_name=$(cat "$DEFAULT_PROFILE_FILE")
-            using_default=true
-        else
-            log_error "No default profile set"
-            echo "Use 'brew-sync profile set PROFILE' to set a default profile"
-            echo "Or specify a profile: brew-sync profile show PROFILE"
-            exit 1
-        fi
-    fi
-    
-    if ! validate_profile_name "$profile_name"; then
-        log_error "Invalid profile name: $profile_name"
-        exit 1
-    fi
-    
-    # Auto-detect backup location
-    detect_backup_location 2>/dev/null || BACKUP_DIR="$DEFAULT_BACKUP_DIR"
-    
-    local profile_dir="$BACKUP_DIR/$PROFILES_DIR/$profile_name"
-    
-    if [ -d "$profile_dir" ]; then
-        if [ "$using_default" = true ]; then
-            echo "Profile: $profile_name (default)"
-        else
-            echo "Profile: $profile_name"
-        fi
-        echo "Path: $profile_dir"
-        echo ""
-        
-        # Show metadata if available
-        if [ -f "$profile_dir/metadata.json" ]; then
-            echo "Metadata:"
-            if command -v jq >/dev/null 2>&1; then
-                jq . "$profile_dir/metadata.json" 2>/dev/null | sed 's/^/  /' || {
-                    echo "  (Metadata file exists but couldn't parse with jq)"
-                    cat "$profile_dir/metadata.json" | sed 's/^/  /'
-                }
-            else
-                cat "$profile_dir/metadata.json" | sed 's/^/  /'
-            fi
-            echo ""
-        fi
-        
-        # Show package statistics
-        if [ -f "$profile_dir/Brewfile" ]; then
-            local brew_count cask_count mas_count total_count
-            brew_count=$(grep -c "^brew " "$profile_dir/Brewfile" 2>/dev/null || echo "0")
-            cask_count=$(grep -c "^cask " "$profile_dir/Brewfile" 2>/dev/null || echo "0")
-            mas_count=$(grep -c "^mas " "$profile_dir/Brewfile" 2>/dev/null || echo "0")
-            total_count=$((brew_count + cask_count + mas_count))
-            
-            local last_updated
-            last_updated=$(stat -f %Sm -t "%Y-%m-%d %H:%M" "$profile_dir/Brewfile" 2>/dev/null || echo "unknown")
-            
-            echo "Package statistics:"
-            echo "  Homebrew packages: $brew_count"
-            echo "  Cask applications: $cask_count"
-            echo "  Mac App Store apps: $mas_count"
-            echo "  Total packages: $total_count"
-            echo "  Last updated: $last_updated"
-        else
-            echo "No Brewfile found in this profile"
-        fi
-    else
-        log_error "Profile '$profile_name' not found"
-        echo ""
-        echo "Available profiles:"
-        get_available_profiles
-        exit 1
-    fi
-}
 
 # Function: Parse Brewfile and extract packages by type
 parse_brewfile() {
@@ -2092,6 +2191,21 @@ apply_package_changes() {
 edit_profile() {
     local profile_name="$1"
     
+    # Handle help
+    if [[ "$1" == "--help" || "$1" == "-h" ]]; then
+        echo "Usage: brew-sync edit [profile]"
+        echo ""
+        echo "Edit profile Brewfile with default editor"
+        echo ""
+        echo "Arguments:"
+        echo "  profile              Profile to edit (optional)"
+        echo ""
+        echo "Examples:"
+        echo "  brew-sync edit               # Edit default profile or select one"
+        echo "  brew-sync edit work          # Edit work profile"
+        exit 0
+    fi
+    
     # Auto-detect backup location
     if ! detect_backup_location 2>/dev/null; then
         log_error "Could not detect backup location. Please run backup first."
@@ -2247,22 +2361,20 @@ profile_usage() {
     echo "Usage: brew-sync profile [command] [options]"
     echo ""
     echo "Commands:"
-    echo "  show PROFILE            Show profile details and statistics"
-    echo "  set PROFILE             Set profile as default"
+    echo "  set <profile>           Set profile as default"
     echo "  get                     Get current default profile (for scripting)"
-    echo "  edit [PROFILE]          Edit profile Brewfile with default editor"
-    echo "  remove PROFILE          Remove profile (except 'default')"
+    echo "  edit [profile]          Edit profile Brewfile with default editor"
+    echo "  remove <profile>        Remove profile (except 'default')"
     echo ""
     echo "Examples:"
-    echo "  brew-sync profile show work"
     echo "  brew-sync profile set work"
     echo "  brew-sync profile get"
     echo "  brew-sync profile edit work"
     echo "  brew-sync profile edit              # Edit default profile or select one"
     echo "  brew-sync profile remove old-profile"
     echo ""
-    echo "To list/create/use profiles:"
-    echo "  brew-sync list                           # List all profiles and backups"
+    echo "To view/create/use profiles:"
+    echo "  brew-sync status                         # Show all profiles"
     echo "  brew-sync backup --profile work          # Create/update work profile"
     echo "  brew-sync restore --profile work         # Restore from work profile"
     echo ""
@@ -2442,9 +2554,10 @@ cleanup_usage() {
     echo "Usage: brew-sync cleanup [options]"
     echo ""
     echo "Options:"
-    echo "  --compress-after DAYS    Compress backups older than N days (default: 30)"
-    echo "  --archive-after DAYS     Archive backups older than N days (default: 365)"
+    echo "  --compress-after <days>  Compress backups older than N days (default: 30)"
+    echo "  --archive-after <days>   Archive backups older than N days (default: 365)"
     echo "  --remove-duplicates      Remove duplicate backup files"
+    echo "  --keep-history <count>   Keep only N recent backups per profile (default: 10)"
     echo "  --dry-run               Show what would be cleaned up without doing it"
     echo "  --all                   Perform all cleanup operations"
     echo "  -h, --help              Show this help"
@@ -2452,7 +2565,7 @@ cleanup_usage() {
     echo "Examples:"
     echo "  brew-sync cleanup                              # Default cleanup (compress + dedup)"
     echo "  brew-sync cleanup --compress-after 14         # Compress after 14 days"
-    echo "  brew-sync cleanup --remove-duplicates         # Only remove duplicates"
+    echo "  brew-sync cleanup --keep-history 5            # Keep only 5 recent backups per profile"
     echo "  brew-sync cleanup --dry-run                   # Preview cleanup actions"
     echo "  brew-sync cleanup --all                       # Full cleanup with archiving"
     echo ""
@@ -2470,6 +2583,7 @@ do_cleanup() {
     local DRY_RUN=false
     local DO_COMPRESSION=true
     local DO_ARCHIVING=false
+    local KEEP_HISTORY=10
     
     # Parse cleanup arguments
     while [[ $# -gt 0 ]]; do
@@ -2491,6 +2605,10 @@ do_cleanup() {
             --dry-run)
                 DRY_RUN=true
                 shift
+                ;;
+            --keep-history)
+                KEEP_HISTORY="$2"
+                shift 2
                 ;;
             --all)
                 REMOVE_DUPLICATES=true
@@ -2620,7 +2738,7 @@ list_backups() {
         
         # Show legacy host-based backups
         if [ -d "$BACKUP_DIR/hosts" ]; then
-            echo "📱 Legacy host-based backups (need migration):"
+            echo "Legacy host-based backups (need migration):"
             for host_dir in "$BACKUP_DIR/hosts"/*; do
                 if [ -d "$host_dir" ] && [ -f "$host_dir/Brewfile" ]; then
                     local hostname=$(basename "$host_dir")
@@ -2654,36 +2772,32 @@ list_backups() {
                 
                 # Check for metadata.json
                 if [ -f "$profile_dir/metadata.json" ]; then
-                    if command -v jq >/dev/null 2>&1; then
-                        local last_backup
-                        local hostname
-                        local brew_count
-                        local cask_count
-                        local mas_count
-                        
-                        last_backup=$(jq -r '.last_backup // "unknown"' "$profile_dir/metadata.json" 2>/dev/null)
-                        hostname=$(jq -r '.hostname // "unknown"' "$profile_dir/metadata.json" 2>/dev/null)
-                        brew_count=$(jq -r '.package_count.brew // 0' "$profile_dir/metadata.json" 2>/dev/null)
-                        cask_count=$(jq -r '.package_count.cask // 0' "$profile_dir/metadata.json" 2>/dev/null)
-                        mas_count=$(jq -r '.package_count.mas // 0' "$profile_dir/metadata.json" 2>/dev/null)
-                        
-                        echo "📂 $profile"
-                        echo "   Last backup: $last_backup"
-                        echo "   From host: $hostname"
-                        echo "   Packages: brew($brew_count) cask($cask_count) mas($mas_count)"
-                    else
-                        echo "📂 $profile (packages: $pkg_count)"
-                    fi
+                    local last_backup
+                    local hostname
+                    local brew_count
+                    local cask_count
+                    local mas_count
+                    
+                    last_backup=$(get_metadata_field "$profile_dir/metadata.json" "last_backup" "unknown")
+                    hostname=$(get_metadata_field "$profile_dir/metadata.json" "hostname" "unknown")
+                    brew_count=$(get_metadata_field "$profile_dir/metadata.json" "package_count.brew" "0")
+                    cask_count=$(get_metadata_field "$profile_dir/metadata.json" "package_count.cask" "0")
+                    mas_count=$(get_metadata_field "$profile_dir/metadata.json" "package_count.mas" "0")
+                    
+                    echo "Profile: $profile"
+                    echo "   Last backup: $last_backup"
+                    echo "   From host: $hostname"
+                    echo "   Packages: brew($brew_count) cask($cask_count) mas($mas_count)"
                 # Fallback to backup_info.txt
                 elif [ -f "$profile_dir/backup_info.txt" ]; then
                     local last_backup=$(grep "Last backup:" "$profile_dir/backup_info.txt" | cut -d: -f2- | xargs)
                     local hostname=$(grep "Hostname:" "$profile_dir/backup_info.txt" | cut -d: -f2- | xargs)
-                    echo "📂 $profile"
+                    echo "Profile: $profile"
                     echo "   Last backup: $last_backup"
                     echo "   From host: $hostname"
                     echo "   Packages: $pkg_count"
                 else
-                    echo "📂 $profile (packages: $pkg_count)"
+                    echo "Profile: $profile (packages: $pkg_count)"
                 fi
                 
                 # Show backup files count
@@ -2696,6 +2810,45 @@ list_backups() {
                 echo ""
             fi
         done
+        
+        # Clean up old history files (keep only latest N backups per profile)
+        if [ "$KEEP_HISTORY" -gt 0 ]; then
+            echo "Cleaning up backup history (keeping $KEEP_HISTORY most recent per profile)..."
+            
+            for profile_path in "$BACKUP_DIR"/profiles/*/; do
+                if [ -d "$profile_path" ]; then
+                    local profile_name=$(basename "$profile_path")
+                    local backup_files
+                    
+                    # Get all backup files sorted by modification time (newest first)
+                    backup_files=$(find "$profile_path" -name "Brewfile_[0-9]*" -type f | sort -r)
+                    
+                    local count=0
+                    local removed_count=0
+                    
+                    while IFS= read -r backup_file; do
+                        if [ -n "$backup_file" ]; then
+                            count=$((count + 1))
+                            
+                            # Keep the first KEEP_HISTORY files, remove the rest
+                            if [ $count -gt "$KEEP_HISTORY" ]; then
+                                if [ "$DRY_RUN" = true ]; then
+                                    echo "[DRY RUN] Would remove: $(basename "$backup_file")"
+                                else
+                                    rm "$backup_file"
+                                    echo "Removed old backup: $(basename "$backup_file")"
+                                fi
+                                removed_count=$((removed_count + 1))
+                            fi
+                        fi
+                    done <<< "$backup_files"
+                    
+                    if [ $removed_count -gt 0 ]; then
+                        echo "Profile '$profile_name': removed $removed_count old backup(s)"
+                    fi
+                fi
+            done
+        fi
         
         if [ "$found_profiles" = false ]; then
             echo "No profiles found. Run 'brew-sync backup' to create your first profile."
@@ -2713,14 +2866,17 @@ do_backup() {
     local USE_GIT=false
     local AUTO_DETECT=true
     local INTERACTIVE_STORAGE=false
+    local DRY_RUN=false
+
+    # Check if first argument is a profile name (not an option)
+    if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+        PROFILE="$1"
+        shift
+    fi
 
     # Parse backup arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
-            -p|--profile)
-                PROFILE="$2"
-                shift 2
-                ;;
             --select-storage)
                 INTERACTIVE_STORAGE=true
                 AUTO_DETECT=false
@@ -2782,6 +2938,10 @@ do_backup() {
                 ;;
             -v|--verbose)
                 VERBOSE=true
+                shift
+                ;;
+            -d|--dry-run)
+                DRY_RUN=true
                 shift
                 ;;
             -h|--help)
@@ -2881,6 +3041,38 @@ do_backup() {
         log_error "Failed to generate package list"
         rm -rf "$TEMP_DIR"
         exit 1
+    fi
+    
+    # If dry-run, show preview and exit
+    if [ "$DRY_RUN" = true ]; then
+        log_info "=== DRY RUN mode ==="
+        log_info "Would backup current packages to profile: $PROFILE"
+        log_info "Backup location: $BACKUP_DIR/profiles/$PROFILE"
+        
+        # Count packages
+        local brew_count=$(grep -c "^brew " "$TEMP_DIR/$BREWFILE_NAME" 2>/dev/null || echo "0")
+        local cask_count=$(grep -c "^cask " "$TEMP_DIR/$BREWFILE_NAME" 2>/dev/null || echo "0")
+        local mas_count=$(grep -c "^mas " "$TEMP_DIR/$BREWFILE_NAME" 2>/dev/null || echo "0")
+        local total_count=$((brew_count + cask_count + mas_count))
+        
+        log_info "Packages to backup: $brew_count brew, $cask_count cask, $mas_count mas ($total_count total)"
+        
+        # Check if there are changes
+        if [ -f "$PROFILE_DIR/$BREWFILE_NAME" ]; then
+            if ! diff "$TEMP_DIR/$BREWFILE_NAME" "$PROFILE_DIR/$BREWFILE_NAME" >/dev/null 2>&1; then
+                log_info "Changes detected - backup would proceed"
+            else
+                log_info "No changes detected - backup would be skipped"
+            fi
+        else
+            log_info "No existing backup - new backup would be created"
+        fi
+        
+        log_info ""
+        log_info "To proceed: brew-sync backup $PROFILE"
+        
+        rm -rf "$TEMP_DIR"
+        return 0
     fi
 
     # Profile-specific backup
@@ -2995,7 +3187,7 @@ EOF
 
     # Available restore options guide
     echo ""
-    log_info "📱 Restore options:"
+    log_info "Restore options:"
     case "$BACKUP_METHOD" in
         "git")
             log_info "  On other Mac: git clone <repository-url> && cd <repo> && brew-sync restore"
@@ -3037,6 +3229,12 @@ do_restore() {
     local AUTO_DETECT=true
     local INTERACTIVE_STORAGE=false
 
+    # Check if first argument is a profile name (not an option)
+    if [[ $# -gt 0 && ! "$1" =~ ^- ]]; then
+        PROFILE="$1"
+        shift
+    fi
+
     # Parse restore arguments
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -3055,10 +3253,6 @@ do_restore() {
             -v|--verbose)
                 VERBOSE=true
                 shift
-                ;;
-            -p|--profile)
-                PROFILE="$2"
-                shift 2
                 ;;
             -l|--list)
                 # Auto-detect backup location for listing
@@ -3235,11 +3429,21 @@ do_restore() {
 
     if [ -f "$METADATA_FILE" ]; then
         log_info "Profile information:"
-        if command -v jq >/dev/null 2>&1; then
-            jq -r '"  Last backup: " + .last_backup + "\n  From host: " + .hostname + "\n  Packages: brew(" + (.package_count.brew | tostring) + ") cask(" + (.package_count.cask | tostring) + ") mas(" + (.package_count.mas | tostring) + ")"' "$METADATA_FILE"
-        else
-            grep -E '"(last_backup|hostname)"' "$METADATA_FILE" | sed 's/^/  /'
-        fi
+        local last_backup
+        local hostname
+        local brew_count
+        local cask_count
+        local mas_count
+        
+        last_backup=$(get_metadata_field "$METADATA_FILE" "last_backup" "unknown")
+        hostname=$(get_metadata_field "$METADATA_FILE" "hostname" "unknown")
+        brew_count=$(get_metadata_field "$METADATA_FILE" "package_count.brew" "0")
+        cask_count=$(get_metadata_field "$METADATA_FILE" "package_count.cask" "0")
+        mas_count=$(get_metadata_field "$METADATA_FILE" "package_count.mas" "0")
+        
+        echo "  Last backup: $last_backup"
+        echo "  From host: $hostname"
+        echo "  Packages: brew($brew_count) cask($cask_count) mas($mas_count)"
         echo
     elif [ -f "$BACKUP_INFO_FILE" ]; then
         log_info "Backup information:"
@@ -3347,7 +3551,7 @@ do_restore() {
     else
         log_info "[DRY-RUN] For actual installation, run again without -d option"
         echo ""
-        log_info "💡 Recommended command:"
+        log_info "Recommended command:"
         log_info "  Actual installation: brew-sync restore --profile $PROFILE"
     fi
     
@@ -3357,6 +3561,348 @@ do_restore() {
         log_info "Cleaned up temporary files"
     fi
     
+}
+
+# Function: Show status (profiles overview or specific profile details)
+do_status() {
+    local PROFILE=""
+    
+    # Parse arguments
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -h|--help)
+                echo "Usage: brew-sync status [profile]"
+                echo ""
+                echo "Show backup status:"
+                echo "  status              Show all profiles summary"
+                echo "  status <profile>    Show specific profile details"
+                echo ""
+                echo "Examples:"
+                echo "  brew-sync status           # Show all profiles"
+                echo "  brew-sync status work      # Show work profile details"
+                exit 0
+                ;;
+            *)
+                if [ -z "$PROFILE" ]; then
+                    PROFILE="$1"
+                else
+                    log_error "Unknown status option: $1"
+                    exit 1
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    # Determine backup location
+    detect_backup_location 2>/dev/null || BACKUP_DIR="$DEFAULT_BACKUP_DIR"
+    
+    # Check for migration before proceeding
+    if check_migration_needed "$BACKUP_DIR"; then
+        migrate_hosts_to_profiles "$BACKUP_DIR" || {
+            log_error "Migration failed. Status command aborted."
+            exit 1
+        }
+    fi
+    
+    local profiles_dir="$BACKUP_DIR/profiles"
+    
+    if [ ! -d "$profiles_dir" ]; then
+        log_error "No profiles found at $profiles_dir"
+        exit 1
+    fi
+    
+    # Show specific profile details or all profiles summary
+    if [ -n "$PROFILE" ]; then
+        # Show specific profile details
+        local profile_dir="$profiles_dir/$PROFILE"
+        if [ ! -d "$profile_dir" ]; then
+            log_error "Profile '$PROFILE' not found"
+            exit 1
+        fi
+        
+        # Show storage location (concise)
+        local storage_info
+        if [[ "$BACKUP_DIR" == *"CloudDocs"* ]] || [[ "$BACKUP_DIR" == *"iCloud"* ]]; then
+            storage_info="icloud"
+        elif [[ "$BACKUP_DIR" == *"Dropbox"* ]]; then
+            storage_info="dropbox"
+        elif [[ "$BACKUP_DIR" == *"Google Drive"* ]] || [[ "$BACKUP_DIR" == *"GoogleDrive"* ]]; then
+            storage_info="google-drive"
+        elif [[ "$BACKUP_DIR" == "$HOME/.brew-sync" ]]; then
+            storage_info="local"
+        else
+            storage_info="custom"
+        fi
+        
+        log_status "Storage: $storage_info ($BACKUP_DIR)"
+        format_profile_detail "$PROFILE" "$profile_dir"
+    else
+        # Show all profiles summary
+        local storage_info
+        if [[ "$BACKUP_DIR" == *"CloudDocs"* ]] || [[ "$BACKUP_DIR" == *"iCloud"* ]]; then
+            storage_info="icloud"
+        elif [[ "$BACKUP_DIR" == *"Dropbox"* ]]; then
+            storage_info="dropbox"
+        elif [[ "$BACKUP_DIR" == *"Google Drive"* ]] || [[ "$BACKUP_DIR" == *"GoogleDrive"* ]]; then
+            storage_info="google-drive"
+        elif [[ "$BACKUP_DIR" == "$HOME/.brew-sync" ]]; then
+            storage_info="local"
+        else
+            storage_info="custom"
+        fi
+        
+        log_status "Profiles ($storage_info):"
+        
+        # List all profiles
+        local found_any=false
+        for profile_path in "$profiles_dir"/*; do
+            if [ -d "$profile_path" ]; then
+                local profile_name
+                profile_name=$(basename "$profile_path")
+                format_profile_summary "$profile_name" "$profile_path"
+                found_any=true
+            fi
+        done
+        
+        if [ "$found_any" = false ]; then
+            echo "No profiles found"
+        fi
+    fi
+}
+
+# Function: Show backup history for a profile
+do_history() {
+    local profile="$1"
+    
+    if [ "$profile" = "--help" ] || [ "$profile" = "-h" ]; then
+        history_usage
+        return 0
+    fi
+    
+    local backup_dir
+    if [ -f "$LAST_STORAGE_FILE" ]; then
+        backup_dir=$(grep "^path=" "$LAST_STORAGE_FILE" | cut -d'=' -f2 | tr -d '"')
+    else
+        log_error "No backup location configured. Run 'brew-sync backup' first."
+        return 1
+    fi
+    
+    if [ -z "$profile" ]; then
+        log_error "Profile name required"
+        history_usage
+        return 1
+    fi
+    
+    # Get backup history
+    local backup_files
+    backup_files=$(get_backup_history "$profile" "$backup_dir")
+    
+    if [ $? -ne 0 ] || [ -z "$backup_files" ]; then
+        log_error "No history found for profile '$profile'"
+        return 1
+    fi
+    
+    echo "Backup history for '$profile':"
+    
+    local index=1
+    while IFS= read -r backup_file; do
+        if [ -n "$backup_file" ]; then
+            local info
+            info=$(parse_backup_info "$backup_file")
+            if [ -n "$info" ]; then
+                local datetime=$(echo "$info" | cut -d'|' -f1)
+                local count=$(echo "$info" | cut -d'|' -f2)
+                local relative_time
+                relative_time=$(format_relative_time "$datetime")
+                
+                echo "[$index] $relative_time ($count packages)"
+                index=$((index + 1))
+            fi
+        fi
+    done <<< "$backup_files"
+    
+    if [ $index -eq 1 ]; then
+        echo "No backup history found"
+    fi
+}
+
+# Function: Rollback to previous backup
+do_rollback() {
+    local profile=""
+    local index=""
+    local dry_run=""
+    
+    # Parse options
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --help|-h)
+                rollback_usage
+                return 0
+                ;;
+            --dry-run|-d)
+                dry_run="true"
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                rollback_usage
+                return 1
+                ;;
+            *)
+                if [ -z "$profile" ]; then
+                    profile="$1"
+                elif [ -z "$index" ]; then
+                    index="$1"
+                fi
+                shift
+                ;;
+        esac
+    done
+    
+    if [ -z "$profile" ]; then
+        log_error "Profile name required"
+        rollback_usage
+        return 1
+    fi
+    
+    # Get backup directory
+    local backup_dir
+    if [ -f "$LAST_STORAGE_FILE" ]; then
+        backup_dir=$(grep "^path=" "$LAST_STORAGE_FILE" | cut -d'=' -f2 | tr -d '"')
+    else
+        log_error "No backup location configured. Run 'brew-sync backup' first."
+        return 1
+    fi
+    
+    # Get backup history
+    local backup_files
+    backup_files=$(get_backup_history "$profile" "$backup_dir")
+    
+    if [ $? -ne 0 ] || [ -z "$backup_files" ]; then
+        log_error "No history found for profile '$profile'"
+        return 1
+    fi
+    
+    # Convert backup files to array for indexing
+    local -a backup_array
+    while IFS= read -r backup_file; do
+        if [ -n "$backup_file" ]; then
+            backup_array+=("$backup_file")
+        fi
+    done <<< "$backup_files"
+    
+    # If no index specified, show interactive selection
+    if [ -z "$index" ]; then
+        echo "Available backups for '$profile':"
+        local i=1
+        for backup_file in "${backup_array[@]}"; do
+            local info
+            info=$(parse_backup_info "$backup_file")
+            if [ -n "$info" ]; then
+                local datetime=$(echo "$info" | cut -d'|' -f1)
+                local count=$(echo "$info" | cut -d'|' -f2)
+                local relative_time
+                relative_time=$(format_relative_time "$datetime")
+                
+                echo "[$i] $relative_time ($count packages)"
+                i=$((i + 1))
+            fi
+        done
+        echo ""
+        read -p "Select backup to restore [1-$((i-1))]: " index
+    fi
+    
+    # Validate index
+    if ! [[ "$index" =~ ^[0-9]+$ ]] || [ "$index" -lt 1 ] || [ "$index" -gt ${#backup_array[@]} ]; then
+        log_error "Invalid selection: $index"
+        return 1
+    fi
+    
+    # Get selected backup file
+    local selected_backup="${backup_array[$((index-1))]}"
+    local info
+    info=$(parse_backup_info "$selected_backup")
+    local datetime=$(echo "$info" | cut -d'|' -f1)
+    local count=$(echo "$info" | cut -d'|' -f2)
+    local relative_time
+    relative_time=$(format_relative_time "$datetime")
+    
+    if [ "$dry_run" = "true" ]; then
+        echo "=== DRY RUN mode ==="
+        echo "Would rollback profile '$profile' to:"
+        echo "  Backup: $relative_time ($count packages)"
+        echo "  File: $(basename "$selected_backup")"
+        echo ""
+        echo "To proceed: brew-sync rollback $profile $index"
+        return 0
+    fi
+    
+    # Confirm rollback
+    echo "Rollback profile '$profile' to $relative_time backup?"
+    echo "This will replace last version of '$profile' profile. Continue? [y/N]"
+    read -r confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Rollback cancelled"
+        return 0
+    fi
+    
+    # Perform rollback
+    local profile_dir="$backup_dir/profiles/$profile"
+    local current_brewfile="$profile_dir/Brewfile"
+    
+    # Backup current state first
+    if [ -f "$current_brewfile" ]; then
+        local backup_timestamp
+        backup_timestamp=$(date +%Y%m%d_%H%M%S)
+        local current_backup="$profile_dir/Brewfile_rollback_backup_$backup_timestamp"
+        cp "$current_brewfile" "$current_backup"
+        log_info "Current state backed up as: $(basename "$current_backup")"
+    fi
+    
+    # Copy selected backup to current Brewfile
+    if [[ "$selected_backup" == *.gz ]]; then
+        zcat "$selected_backup" > "$current_brewfile"
+    else
+        cp "$selected_backup" "$current_brewfile"
+    fi
+    
+    log_success "Rollback completed"
+    echo "Profile '$profile' restored to $relative_time backup"
+}
+
+# Function: Print rollback usage
+rollback_usage() {
+    echo "Usage: brew-sync rollback <profile> [index] [options]"
+    echo ""
+    echo "Rollback profile to previous backup"
+    echo ""
+    echo "Arguments:"
+    echo "  profile              Profile name (required)"
+    echo "  index                Backup index (optional, interactive if not specified)"
+    echo ""
+    echo "Options:"
+    echo "  -d, --dry-run        Preview rollback without making changes"
+    echo "  -h, --help           Show this help"
+    echo ""
+    echo "Examples:"
+    echo "  brew-sync rollback work         # Interactive selection"
+    echo "  brew-sync rollback work 2       # Rollback to 2nd backup"
+    echo "  brew-sync rollback work 1 --dry-run  # Preview rollback"
+}
+
+# Function: Print history usage
+history_usage() {
+    echo "Usage: brew-sync history <profile>"
+    echo ""
+    echo "Show backup history for profile"
+    echo ""
+    echo "Arguments:"
+    echo "  profile              Profile name (required)"
+    echo ""
+    echo "Examples:"
+    echo "  brew-sync history work      # Show work profile history"
+    echo "  brew-sync history default   # Show default profile history"
 }
 
 # Function: Print update usage
@@ -3571,10 +4117,29 @@ case "$1" in
         shift
         do_restore "$@"
         ;;
-    list)
-        # Auto-detect backup location for listing
-        detect_backup_location 2>/dev/null || BACKUP_DIR="$DEFAULT_BACKUP_DIR"
-        list_backups
+    status)
+        shift
+        do_status "$@"
+        ;;
+    history)
+        shift
+        do_history "$@"
+        ;;
+    rollback)
+        shift
+        do_rollback "$@"
+        ;;
+    edit)
+        shift
+        edit_profile "$@"
+        ;;
+    set)
+        shift
+        set_profile "$@"
+        ;;
+    remove)
+        shift
+        remove_profile "$@"
         ;;
     profile)
         shift

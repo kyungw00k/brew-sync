@@ -107,7 +107,9 @@ brew-sync set work                 # Set work as default profile
 brew-sync remove old               # Remove old profile (except 'default')
 
 # History commands
-brew-sync history work             # Show backup history for profile
+brew-sync history                  # Show backup history for default profile
+brew-sync history work             # Show backup history for specific profile
+brew-sync rollback                 # Interactive rollback for default profile
 brew-sync rollback work            # Interactive rollback to previous backup
 brew-sync update               # Update to latest version
 brew-sync update --check       # Check for updates only
@@ -175,6 +177,9 @@ brew-sync automatically maintains a complete history of your backups, making it 
 
 ### View Backup History
 ```bash
+# Show all backups for default profile
+brew-sync history
+
 # Show all backups for work profile
 brew-sync history work
 
@@ -187,7 +192,11 @@ brew-sync history work
 
 ### Rollback to Previous Backup
 ```bash
-# Interactive rollback - shows menu to select
+# Interactive rollback for default profile - shows menu to select
+brew-sync rollback
+# Select backup [1-3]: 2
+
+# Interactive rollback for work profile - shows menu to select
 brew-sync rollback work
 # Select backup [1-3]: 2
 

@@ -1364,8 +1364,8 @@ usage() {
     echo "  brew-sync backup [profile]    # Backup current packages"
     echo "  brew-sync restore [profile]   # Restore packages from backup"
     echo "  brew-sync status [profile]    # Show backup status"
-    echo "  brew-sync history <profile>   # Show backup history"
-    echo "  brew-sync rollback <profile>  # Rollback to previous backup"
+    echo "  brew-sync history [profile]   # Show backup history"
+    echo "  brew-sync rollback [profile]  # Rollback to previous backup"
     echo "  brew-sync edit [profile]      # Edit profile Brewfile"
     echo "  brew-sync set <profile>       # Set default profile"
     echo "  brew-sync remove <profile>    # Remove profile"
@@ -3689,9 +3689,13 @@ do_history() {
     fi
     
     if [ -z "$profile" ]; then
-        log_error "Profile name required"
-        history_usage
-        return 1
+        # Try to load default profile if none specified
+        if ! profile=$(load_default_profile); then
+            log_error "Profile name required"
+            history_usage
+            return 1
+        fi
+        log_info "Using default profile: $profile"
     fi
     
     # Get backup history
@@ -3761,9 +3765,13 @@ do_rollback() {
     done
     
     if [ -z "$profile" ]; then
-        log_error "Profile name required"
-        rollback_usage
-        return 1
+        # Try to load default profile if none specified
+        if ! profile=$(load_default_profile); then
+            log_error "Profile name required"
+            rollback_usage
+            return 1
+        fi
+        log_info "Using default profile: $profile"
     fi
     
     # Get backup directory
@@ -3873,12 +3881,12 @@ do_rollback() {
 
 # Function: Print rollback usage
 rollback_usage() {
-    echo "Usage: brew-sync rollback <profile> [index] [options]"
+    echo "Usage: brew-sync rollback [profile] [index] [options]"
     echo ""
     echo "Rollback profile to previous backup"
     echo ""
     echo "Arguments:"
-    echo "  profile              Profile name (required)"
+    echo "  profile              Profile name (optional, uses default if not specified)"
     echo "  index                Backup index (optional, interactive if not specified)"
     echo ""
     echo "Options:"
@@ -3886,21 +3894,23 @@ rollback_usage() {
     echo "  -h, --help           Show this help"
     echo ""
     echo "Examples:"
-    echo "  brew-sync rollback work         # Interactive selection"
+    echo "  brew-sync rollback              # Interactive selection (uses default profile)"
+    echo "  brew-sync rollback work         # Interactive selection for work profile"
     echo "  brew-sync rollback work 2       # Rollback to 2nd backup"
     echo "  brew-sync rollback work 1 --dry-run  # Preview rollback"
 }
 
 # Function: Print history usage
 history_usage() {
-    echo "Usage: brew-sync history <profile>"
+    echo "Usage: brew-sync history [profile]"
     echo ""
     echo "Show backup history for profile"
     echo ""
     echo "Arguments:"
-    echo "  profile              Profile name (required)"
+    echo "  profile              Profile name (optional, uses default if not specified)"
     echo ""
     echo "Examples:"
+    echo "  brew-sync history           # Show history for default profile"
     echo "  brew-sync history work      # Show work profile history"
     echo "  brew-sync history default   # Show default profile history"
 }

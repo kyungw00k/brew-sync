@@ -115,6 +115,11 @@ brew-sync update               # Update to latest version
 brew-sync update --check       # Check for updates only
 brew-sync uninstall            # Uninstall brew-sync
 brew-sync help                 # Get help
+
+# Get detailed help for specific commands
+brew-sync backup --help         # Show backup options and usage
+brew-sync restore --help        # Show restore options and usage
+brew-sync <command> --help      # Show help for any command
 ```
 
 ## Profile Editing

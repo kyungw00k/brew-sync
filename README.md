@@ -30,7 +30,8 @@ That's it! All your Homebrew packages, GUI apps, and Mac App Store apps are now 
 - **Safe profile editing**: Edit package lists with diff preview and confirmation
 - **Backup history**: View and rollback to previous backup versions
 - **Interactive rollback**: Select from backup history with simple numbered menu
-- **Clean CLI interface**: Concise output with optional verbose mode (`--verbose`)
+- **Clean CLI interface**: Minimal output by default, detailed with `--verbose`
+- **Smart help system**: Context-aware help with `--help` for most commands
 - **Preview mode**: `--dry-run` to see what will be installed/restored
 - **History management**: Automatic cleanup of old backups with configurable retention
 - **Simple**: Just `backup` and `restore` - auto-detects everything
@@ -63,17 +64,14 @@ brew-sync backup
 # 🔧 Profile Setup
 #
 # Found existing profiles:
-# ┌─────────────────────┬─────────────┬──────────────┐
-# │ Profile             │ Packages    │ Last Updated │
-# ├─────────────────────┼─────────────┼──────────────┤
-# │ default             │ 120 pkgs    │ 2024-01-15   │
-# │ work                │ 85 pkgs     │ 2024-01-10   │
-# └─────────────────────┴─────────────┴──────────────┘
+# Profiles (icloud):
+# default      2024-12-15T14:32:10+09:00    brew(85) cask(15) mas(12)
+# work         2024-12-14T09:15:42+09:00    brew(67) cask(8) mas(5)
 #
 # Setup options:
 # 1) Use 'default' profile (recommended)
 # 2) Use existing profile from list above
-# 3) Create new profile based on hostname ('mbp')
+# 3) Create new profile based on hostname ('MacBook-Pro')
 # 4) Enter custom profile name
 #
 # Select option (1-4): 
@@ -81,11 +79,11 @@ brew-sync backup
 
 ### Daily Usage
 ```bash
-# Backup packages (uses your saved preference)
+# Backup packages (minimal output by default)
 brew-sync backup
 brew-sync backup --verbose     # Show detailed progress
 
-# Restore packages (uses your saved preference)
+# Restore packages (always preview first!)
 brew-sync restore --dry-run    # Preview first (recommended)
 brew-sync restore              # Actually install
 brew-sync restore --verbose    # Show installation details
@@ -94,9 +92,8 @@ brew-sync restore --verbose    # Show installation details
 brew-sync backup work
 brew-sync restore work
 
-# Machine-specific default profile (automatically loaded from ~/.config/brew-sync/default_profile)
-brew-sync backup                  # Uses machine-specific default profile
-brew-sync restore                 # Uses machine-specific default profile
+# Note: Commands without profile use your default profile
+# (configured per-machine in ~/.config/brew-sync/default_profile)
 
 # Profile management commands
 brew-sync status                   # List all profiles
@@ -106,20 +103,24 @@ brew-sync edit                     # Edit default profile or select one
 brew-sync set work                 # Set work as default profile
 brew-sync remove old               # Remove old profile (except 'default')
 
-# History commands
+# History and rollback
 brew-sync history                  # Show backup history for default profile
 brew-sync history work             # Show backup history for specific profile
 brew-sync rollback                 # Interactive rollback for default profile
-brew-sync rollback work            # Interactive rollback to previous backup
+brew-sync rollback work 2          # Rollback work profile to 2nd backup
 brew-sync update               # Update to latest version
 brew-sync update --check       # Check for updates only
 brew-sync uninstall            # Uninstall brew-sync
 brew-sync help                 # Get help
 
-# Get detailed help for specific commands
+# Get detailed help for specific commands  
 brew-sync backup --help         # Show backup options and usage
 brew-sync restore --help        # Show restore options and usage
-brew-sync <command> --help      # Show help for any command
+brew-sync <command> --help      # Most commands support --help
+
+# Commands with --help support (10 out of 12 commands):
+# backup, restore, status, history, rollback, edit, set, remove, cleanup, update
+# Note: 'help' shows all commands, 'uninstall' is intentionally without --help
 ```
 
 ## Profile Editing
@@ -129,7 +130,6 @@ The `profile edit` feature lets you safely modify your package lists with a diff
 ```bash
 # Edit your work profile
 $ brew-sync edit work
-Using default profile: work
 Editing profile 'work'
 
 Press any key to continue...
@@ -189,21 +189,23 @@ brew-sync history
 brew-sync history work
 
 # Output:
-# Backup history for 'work':
-# [1] 2h ago (103 packages)
-# [2] 2d ago (101 packages)  
-# [3] 1w ago (98 packages)
+# Backup history for 'default':
+# [1] 2d ago (103 packages)
+# [2] 5d ago (98 packages)
+# [3] 1w ago (95 packages)
+# [4] 2w ago (92 packages)
+# [5] 3w ago (90 packages)
 ```
 
 ### Rollback to Previous Backup
 ```bash
 # Interactive rollback for default profile - shows menu to select
 brew-sync rollback
-# Select backup [1-3]: 2
+# Select backup [1-5]: 2
 
 # Interactive rollback for work profile - shows menu to select
 brew-sync rollback work
-# Select backup [1-3]: 2
+# Select backup [1-5]: 2
 
 # Direct rollback to specific backup
 brew-sync rollback work 2
@@ -233,32 +235,57 @@ brew-sync cleanup --keep-history 3 --dry-run
 ## Real-world example
 
 ```bash
-# Work MacBook: backup your development setup
+# Work MacBook: backup your development setup (minimal output)
 $ brew-sync backup work
 Backup completed (67 packages)
 
 # With verbose output:
 $ brew-sync backup work --verbose
-Starting backup for profile 'work' on host 'MacBook-Pro'  
-Generating current package list...
-Package list generated successfully
+Using last saved storage: icloud (/Users/john/Library/Mobile Documents/com~apple~CloudDocs/brew-backup)
+Using profile: work
+  Starting backup for profile 'work' on host 'MacBook-Pro'
+  Generating current package list...
+  Package list generated successfully
 Backup completed (67 packages)
-Location: ~/Library/Mobile Documents/com~apple~CloudDocs/brew-backup/profiles/work/Brewfile
-Packages: 47 brew, 12 cask, 8 MAS apps
+  Location: /Users/john/Library/Mobile Documents/com~apple~CloudDocs/brew-backup/profiles/work
+  Packages: 67 brew, 8 cask, 5 mas
 
 # Home iMac: restore the same setup  
 $ brew-sync restore work --dry-run
-[DRY-RUN] All packages are already installed
+=== DRY RUN mode - No actual installation will be performed ===
+
+  Actual installation: brew-sync restore --profile work
+Restore source: Profile 'work'
+Brewfile path: /Users/john/Library/Mobile Documents/com~apple~CloudDocs/brew-backup/profiles/work/Brewfile
+Profile information:
+  Last backup: 2024-12-14T09:15:42+09:00
+  From host: MacBook-Pro
+  Packages: brew(67) cask(8) mas(5)
+
+Package information to restore:
+  - Homebrew packages: 67
+  - Cask apps: 8
+  - Mac App Store apps: 5
+
+[DRY-RUN] Copying Brewfile to temporary directory
+[DRY-RUN] Packages that need installation:
+[DRY-RUN] Following command will be executed:
+[DRY-RUN] brew bundle --file="/var/folders/ab/1234567890/T/tmp.abc123def/Brewfile" 
+[DRY-RUN] For actual installation, run again without -d option
+
+Recommended command:
+  Actual installation: brew-sync restore --profile work
+Cleaned up temporary files
 
 $ brew-sync restore work
 Restore completed successfully!
 
 # With verbose output:
 $ brew-sync restore work --verbose  
-Starting package installation from /tmp/Brewfile.temp
-Executing: brew bundle --file="/tmp/Brewfile.temp" --no-upgrade
+Starting package installation from /var/folders/ab/1234567890/T/tmp.abc123def/Brewfile
+Executing: brew bundle --file="/var/folders/ab/1234567890/T/tmp.abc123def/Brewfile" --no-upgrade
 Using node, python, docker, git, vscode, slack, cursor...
-`brew bundle` complete! 67 Brewfile dependencies now installed.
+`brew bundle` complete! 80 Brewfile dependencies now installed.
 Restore completed successfully!
 ```
 
@@ -275,7 +302,7 @@ brew-sync backup --dropbox          # Dropbox (temporary)
 brew-sync backup --google-drive     # Google Drive (temporary)
 brew-sync backup --git              # Git repository (temporary)
 brew-sync backup --path ~/backup    # Custom path (temporary)
-brew-sync backup --usb MyUSB        # USB drive (temporary)
+brew-sync backup --path /Volumes/MyUSB/brew-backup  # USB drive (temporary)
 
 # Change your default storage
 brew-sync backup --select-storage   # Interactive selection (saves new default)

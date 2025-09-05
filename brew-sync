@@ -48,6 +48,10 @@ NC='\033[0m' # No Color
 VERBOSE=false
 
 # Enhanced logging functions with verbose support
+log_plain() {
+    echo "$1"
+}
+
 log_info() {
     echo -e "${BLUE}$1${NC}"
 }
@@ -67,6 +71,12 @@ log_error() {
 log_verbose() {
     if [ "$VERBOSE" = true ]; then
         echo -e "${BLUE}  $1${NC}"
+    fi
+}
+
+log_verbose_plain() {
+    if [ "$VERBOSE" = true ]; then
+        echo "$1"
     fi
 }
 
@@ -1266,7 +1276,7 @@ select_storage_interactive() {
     
     if [ ${#storages[@]} -eq 0 ]; then
         log_warning "No cloud storage services detected."
-        log_info "Using default local backup: $DEFAULT_BACKUP_DIR"
+        log_verbose_plain "Using default local backup: $DEFAULT_BACKUP_DIR"
         echo "local|$DEFAULT_BACKUP_DIR"
         return 0
     fi
@@ -1407,7 +1417,6 @@ backup_usage() {
     echo "  --dropbox            Backup to Dropbox (temporary)"
     echo "  --google-drive       Backup to Google Drive (temporary)"
     echo "  --path <path>        Backup to custom path (temporary)"
-    echo "  --usb <volume>       Backup to USB drive (temporary)"
     echo ""
     echo "Examples:"
     echo "  brew-sync backup                    # Backup to default profile"
@@ -1437,7 +1446,6 @@ backup_usage_full() {
     echo "  --dropbox            Backup to Dropbox folder"
     echo "  --google-drive       Backup to Google Drive folder"
     echo "  --path <path>        Custom path"
-    echo "  --usb <volume>       Backup to USB drive (e.g., MyUSB)"
     echo ""
     echo "Backup options:"
     echo "  --select-storage    **Interactively choose storage location (saves as new default)**"
@@ -1452,7 +1460,7 @@ backup_usage_full() {
     echo "  brew-sync backup --git                     # Backup to Git repository"
     echo "  brew-sync backup --dropbox -p dev          # Backup to Dropbox with dev profile"
     echo "  brew-sync backup --path ~/my-backup        # Custom path"
-    echo "  brew-sync backup --usb MyUSB               # Backup to USB drive"
+    echo "  brew-sync backup --path /Volumes/MyUSB/brew-backup  # USB drive"
 }
 
 # Function: Print restore usage
@@ -1496,7 +1504,6 @@ restore_usage_full() {
     echo "  --dropbox              Restore from Dropbox"
     echo "  --google-drive         Restore from Google Drive"
     echo "  --path <path>          Restore from custom path"
-    echo "  --usb <volume>         Restore from USB drive"
     echo "  --select-storage       **Interactively choose storage location (saves as new default)**"
     echo "  --auto-detect          Auto-detect optimal backup location (default)"
     echo ""
@@ -1547,7 +1554,7 @@ detect_backup_location() {
         local method="${last_storage%%|*}"
         local path="${last_storage#*|}"
         
-        log_info "Using last saved storage: $method ($path)"
+        log_verbose_plain "Using last saved storage: $method ($path)"
         BACKUP_DIR="$path"
         BACKUP_METHOD="$method"
         return 0
@@ -1562,7 +1569,7 @@ detect_backup_location() {
     if [ ${#storages[@]} -eq 0 ]; then
         # No cloud storage detected, use local default
         log_warning "No cloud storage services detected."
-        log_info "Using default local backup: $DEFAULT_BACKUP_DIR"
+        log_verbose_plain "Using default local backup: $DEFAULT_BACKUP_DIR"
         BACKUP_DIR="$DEFAULT_BACKUP_DIR"
         BACKUP_METHOD="local"
         return 0
@@ -2229,7 +2236,7 @@ edit_profile() {
     if [ -z "$profile_name" ]; then
         if [ -f "$DEFAULT_PROFILE_FILE" ]; then
             profile_name=$(cat "$DEFAULT_PROFILE_FILE")
-            log_info "Using default profile: $profile_name"
+            log_verbose_plain "Using default profile: $profile_name"
         else
             log_info "No default profile set. Please select a profile to edit."
             echo ""
@@ -2357,7 +2364,7 @@ EOF
                 log_info "Changes discarded. Profile unchanged."
             fi
         else
-            log_info "No changes detected. Profile unchanged."
+            log_plain "No changes detected. Profile unchanged."
         fi
         
         # Clean up temporary directory
@@ -2938,17 +2945,6 @@ do_backup() {
                 AUTO_DETECT=false
                 shift 2
                 ;;
-            --usb)
-                USB_VOLUME="$2"
-                if [ -d "/Volumes/$USB_VOLUME" ]; then
-                    CUSTOM_PATH="/Volumes/$USB_VOLUME/brew-backup"
-                else
-                    log_error "USB drive not found: /Volumes/$USB_VOLUME"
-                    exit 1
-                fi
-                AUTO_DETECT=false
-                shift 2
-                ;;
             -v|--verbose)
                 VERBOSE=true
                 shift
@@ -3017,7 +3013,7 @@ do_backup() {
     # Set directory paths - use profiles/ structure
     PROFILE_DIR=$(get_profile_path "$BACKUP_DIR" "$PROFILE")
     
-    log_info "Using profile: $PROFILE"
+    log_verbose_plain "Using profile: $PROFILE"
 
     # Check Homebrew installation
     if ! command -v brew &> /dev/null; then
@@ -3059,8 +3055,8 @@ do_backup() {
     # If dry-run, show preview and exit
     if [ "$DRY_RUN" = true ]; then
         log_info "=== DRY RUN mode ==="
-        log_info "Would backup current packages to profile: $PROFILE"
-        log_info "Backup location: $BACKUP_DIR/profiles/$PROFILE"
+        log_verbose_plain "Would backup current packages to profile: $PROFILE"
+        log_verbose_plain "Backup location: $BACKUP_DIR/profiles/$PROFILE"
         
         # Count packages
         local brew_count=$(grep -c "^brew " "$TEMP_DIR/$BREWFILE_NAME" 2>/dev/null || echo "0")
@@ -3068,21 +3064,21 @@ do_backup() {
         local mas_count=$(grep -c "^mas " "$TEMP_DIR/$BREWFILE_NAME" 2>/dev/null || echo "0")
         local total_count=$((brew_count + cask_count + mas_count))
         
-        log_info "Packages to backup: $brew_count brew, $cask_count cask, $mas_count mas ($total_count total)"
+        echo "Packages: $brew_count brew, $cask_count cask, $mas_count mas ($total_count total)"
         
         # Check if there are changes
         if [ -f "$PROFILE_DIR/$BREWFILE_NAME" ]; then
             if ! diff "$TEMP_DIR/$BREWFILE_NAME" "$PROFILE_DIR/$BREWFILE_NAME" >/dev/null 2>&1; then
                 log_info "Changes detected - backup would proceed"
             else
-                log_info "No changes detected - backup would be skipped"
+                echo "No changes detected - backup would be skipped"
             fi
         else
             log_info "No existing backup - new backup would be created"
         fi
         
-        log_info ""
-        log_info "To proceed: brew-sync backup $PROFILE"
+        echo ""
+        echo "To proceed: brew-sync backup $PROFILE"
         
         rm -rf "$TEMP_DIR"
         return 0
@@ -3313,17 +3309,6 @@ do_restore() {
                 ;;
             --path)
                 CUSTOM_PATH="$2"
-                AUTO_DETECT=false
-                shift 2
-                ;;
-            --usb)
-                USB_VOLUME="$2"
-                if [ -d "/Volumes/$USB_VOLUME" ]; then
-                    CUSTOM_PATH="/Volumes/$USB_VOLUME/brew-backup"
-                else
-                    log_error "USB drive not found: /Volumes/$USB_VOLUME"
-                    exit 1
-                fi
                 AUTO_DETECT=false
                 shift 2
                 ;;
@@ -3708,7 +3693,7 @@ do_history() {
             history_usage
             return 1
         fi
-        log_info "Using default profile: $profile"
+        log_verbose_plain "Using default profile: $profile"
     fi
     
     # Get backup history
@@ -3784,7 +3769,7 @@ do_rollback() {
             rollback_usage
             return 1
         fi
-        log_info "Using default profile: $profile"
+        log_verbose_plain "Using default profile: $profile"
     fi
     
     # Get backup directory

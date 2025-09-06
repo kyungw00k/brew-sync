@@ -118,9 +118,9 @@ brew-sync backup --help         # Show backup options and usage
 brew-sync restore --help        # Show restore options and usage
 brew-sync <command> --help      # Most commands support --help
 
-# Commands with --help support (10 out of 12 commands):
+# Commands with --help support (10 out of 13 commands):
 # backup, restore, status, history, rollback, edit, set, remove, cleanup, update
-# Note: 'help' shows all commands, 'uninstall' is intentionally without --help
+# Note: 'help' shows all commands, 'uninstall' and 'profile' (deprecated) are without --help
 ```
 
 ## Profile Editing

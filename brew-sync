@@ -3199,7 +3199,11 @@ EOF
     log_info "Restore options:"
     case "$BACKUP_METHOD" in
         "git")
-            log_info "  On other Mac: git clone <repository-url> && cd <repo> && brew-sync restore"
+            if [ "$PROFILE" = "default" ]; then
+                log_info "  On other Mac: git clone <repository-url> && cd <repo> && brew-sync restore"
+            else
+                log_info "  On other Mac: git clone <repository-url> && cd <repo> && brew-sync restore $PROFILE"
+            fi
             ;;
         "icloud"|"dropbox"|"google-drive")
             log_info "  On other Mac with same cloud service synced:"
@@ -3213,8 +3217,11 @@ EOF
     esac
 
     if [ "$BACKUP_METHOD" != "git" ]; then
-        log_info "  Profile restore: brew-sync restore --profile $PROFILE"
-        log_info "  Default restore: brew-sync restore"
+        if [ "$PROFILE" = "default" ]; then
+            log_info "  Restore: brew-sync restore"
+        else
+            log_info "  Restore: brew-sync restore $PROFILE"
+        fi
         
         # Additional guidance by backup method
         case "$BACKUP_METHOD" in

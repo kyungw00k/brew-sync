@@ -949,6 +949,42 @@ migrate_hosts_to_profiles() {
     return 0
 }
 
+# Function: Find Dropbox path
+# Returns: Dropbox backup path on stdout, exit code 0 if found, 1 if not found
+find_dropbox_path() {
+    for dropbox_path in "$HOME/Dropbox" "$HOME/Library/CloudStorage/Dropbox" "$HOME/Library/CloudStorage/Dropbox-"*; do
+        if [ -d "$dropbox_path" ]; then
+            echo "$dropbox_path/brew-backup"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Function: Find Google Drive path
+# Returns: Google Drive backup path on stdout, exit code 0 if found, 1 if not found
+find_google_drive_path() {
+    for gdrive_path in "$HOME/Google Drive" "$HOME/Library/CloudStorage/GoogleDrive-"*; do
+        if [ -d "$gdrive_path" ]; then
+            echo "$gdrive_path/brew-backup"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Function: Find OneDrive path
+# Returns: OneDrive backup path on stdout, exit code 0 if found, 1 if not found
+find_onedrive_path() {
+    for onedrive_path in "$HOME/OneDrive" "$HOME/Library/CloudStorage/OneDrive-"*; do
+        if [ -d "$onedrive_path" ]; then
+            echo "$onedrive_path/brew-backup"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # Function: Detect all available storage locations
 detect_all_storages() {
     local -a storages=()
@@ -969,28 +1005,22 @@ detect_all_storages() {
     storages+=("local|$BREW_SYNC_LOCAL_DIR|Local storage (.brew-sync)")
     
     # 3. Check Dropbox
-    for dropbox_path in "$HOME/Dropbox" "$HOME/Library/CloudStorage/Dropbox-"*; do
-        if [ -d "$dropbox_path" ]; then
-            storages+=("dropbox|$dropbox_path/brew-backup|Dropbox")
-            break
-        fi
-    done
-    
+    local dropbox_backup_path
+    if dropbox_backup_path=$(find_dropbox_path); then
+        storages+=("dropbox|$dropbox_backup_path|Dropbox")
+    fi
+
     # 4. Check Google Drive
-    for gdrive_path in "$HOME/Google Drive" "$HOME/Library/CloudStorage/GoogleDrive-"*; do
-        if [ -d "$gdrive_path" ]; then
-            storages+=("google-drive|$gdrive_path/brew-backup|Google Drive")
-            break
-        fi
-    done
-    
+    local gdrive_backup_path
+    if gdrive_backup_path=$(find_google_drive_path); then
+        storages+=("google-drive|$gdrive_backup_path|Google Drive")
+    fi
+
     # 5. Check OneDrive
-    for onedrive_path in "$HOME/OneDrive" "$HOME/Library/CloudStorage/OneDrive-"*; do
-        if [ -d "$onedrive_path" ]; then
-            storages+=("onedrive|$onedrive_path/brew-backup|OneDrive")
-            break
-        fi
-    done
+    local onedrive_backup_path
+    if onedrive_backup_path=$(find_onedrive_path); then
+        storages+=("onedrive|$onedrive_backup_path|OneDrive")
+    fi
     
     # Return the array (each element is "method|path|display_name")
     printf '%s\n' "${storages[@]}"
@@ -2913,13 +2943,7 @@ do_backup() {
                 shift
                 ;;
             --dropbox)
-                for dropbox_path in "$HOME/Dropbox" "$HOME/Library/CloudStorage/Dropbox-*"; do
-                    if [ -d "$dropbox_path" ]; then
-                        CUSTOM_PATH="$dropbox_path/brew-backup"
-                        break
-                    fi
-                done
-                if [ -z "$CUSTOM_PATH" ]; then
+                if ! CUSTOM_PATH=$(find_dropbox_path); then
                     log_error "Dropbox folder not found."
                     exit 1
                 fi
@@ -2927,13 +2951,7 @@ do_backup() {
                 shift
                 ;;
             --google-drive)
-                for gdrive_path in "$HOME/Google Drive" "$HOME/Library/CloudStorage/GoogleDrive-*"; do
-                    if [ -d "$gdrive_path" ]; then
-                        CUSTOM_PATH="$gdrive_path/brew-backup"
-                        break
-                    fi
-                done
-                if [ -z "$CUSTOM_PATH" ]; then
+                if ! CUSTOM_PATH=$(find_google_drive_path); then
                     log_error "Google Drive folder not found."
                     exit 1
                 fi
@@ -3287,13 +3305,7 @@ do_restore() {
                 shift
                 ;;
             --dropbox)
-                for dropbox_path in "$HOME/Dropbox" "$HOME/Library/CloudStorage/Dropbox-*"; do
-                    if [ -d "$dropbox_path" ]; then
-                        CUSTOM_PATH="$dropbox_path/brew-backup"
-                        break
-                    fi
-                done
-                if [ -z "$CUSTOM_PATH" ]; then
+                if ! CUSTOM_PATH=$(find_dropbox_path); then
                     log_error "Dropbox folder not found."
                     exit 1
                 fi
@@ -3301,13 +3313,7 @@ do_restore() {
                 shift
                 ;;
             --google-drive)
-                for gdrive_path in "$HOME/Google Drive" "$HOME/Library/CloudStorage/GoogleDrive-*"; do
-                    if [ -d "$gdrive_path" ]; then
-                        CUSTOM_PATH="$gdrive_path/brew-backup"
-                        break
-                    fi
-                done
-                if [ -z "$CUSTOM_PATH" ]; then
+                if ! CUSTOM_PATH=$(find_google_drive_path); then
                     log_error "Google Drive folder not found."
                     exit 1
                 fi
